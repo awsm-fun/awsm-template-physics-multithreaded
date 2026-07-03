@@ -59,9 +59,19 @@ features = [
     "Element",
     "HtmlElement",
     "HtmlCanvasElement",
+    "HtmlInputElement",
     "OffscreenCanvas",
     "Location",
     "UrlSearchParams",
+    # Resolution-scale UI (the fill-rate slider): a persisted preference
+    # (Storage), a touch-device default (MediaQueryList), and the GPU facts the
+    # render worker reports so main can seed the scale + cap the backing store.
+    "Storage",
+    "MediaQueryList",
+    "Gpu",
+    "GpuAdapter",
+    "GpuAdapterInfo",
+    "GpuSupportedLimits",
     "Navigator",
     "WorkerNavigator",
     "WorkerGlobalScope",

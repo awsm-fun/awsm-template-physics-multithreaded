@@ -14,7 +14,7 @@
 //! regardless of the fixed sim rate, with no per-frame messaging. Lighting is
 //! entirely the scene's (the loader instantiates its light nodes).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use awsm_renderer::buffer::shared_arena::foreign_write;
@@ -25,7 +25,7 @@ use web_sys::js_sys;
 
 use crate::protocol::{
     BallMotions, BodyMotion, CameraMsg, ColliderInit, ColliderShapeMsg, DropMsg, PhysicsInit,
-    RenderMsg, ResizeMsg, POSE_RING, ROLE_FLOOR, SIM_HZ,
+    QualityMsg, RenderMsg, ResizeMsg, POSE_RING, ROLE_FLOOR, SIM_HZ,
 };
 
 /// The boxed RAF callback, self-referenced so the render loop can reschedule
@@ -200,6 +200,13 @@ async fn run(
 ) -> Result<(), JsValue> {
     use awsm_renderer::camera::CameraMatrices;
     use awsm_renderer::AwsmRendererBuilder;
+
+    // Tell main the GPU's capabilities up front (before the slow scene load)
+    // so it can seed the resolution scale — a software/fallback adapter can't
+    // push pixels, so main starts it conservative — and cap the canvas backing
+    // store to the device's max texture size. Independent, lightweight adapter
+    // request: cheap, and decoupled from the renderer's own device build below.
+    report_gpu_info().await;
 
     let mut renderer = AwsmRendererBuilder::new(gpu_builder)
         .build()
@@ -408,10 +415,27 @@ async fn run(
     // audio stay coherent while the camera moves because main mirrors the
     // camera yaw to physics (camera-relative W/A/S/D) and to the audio
     // listener (see `audio.rs`).
-    install_render_input(camera.clone(), canvas.clone(), balls, floor, ball_radius)?;
+    // Runtime anti-aliasing: main posts a `QualityMsg` on a Settings toggle;
+    // the input handler drops the requested (msaa, smaa) here, and the render
+    // loop applies it off the render path (see the RAF closure). `reconfiguring`
+    // gates frames out while the async recompile holds the renderer borrow.
+    let pending_aa: Rc<Cell<Option<(bool, bool)>>> = Rc::new(Cell::new(None));
+    let reconfiguring: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    install_render_input(
+        camera.clone(),
+        canvas.clone(),
+        balls,
+        floor,
+        ball_radius,
+        pending_aa.clone(),
+    )?;
 
+    // `Option` so an async anti-aliasing reconfig can take the renderer OUT of
+    // the cell for the duration of its awaits (rather than holding the RefCell
+    // borrow across them); the `reconfiguring` flag keeps the render loop off
+    // the cell while it's `None`. See the RAF closure.
     #[allow(clippy::arc_with_non_send_sync)]
-    let cell = Rc::new(RefCell::new(renderer));
+    let cell = Rc::new(RefCell::new(Some(renderer)));
     #[allow(clippy::arc_with_non_send_sync)]
     let raf: RafCell = Rc::new(RefCell::new(None));
     let raf_init = raf.clone();
@@ -452,7 +476,63 @@ async fn run(
     let mut ball_bindings: Vec<awsm_renderer::buffer::shared_arena::SlotBinding> = Vec::new();
 
     *raf_init.borrow_mut() = Some(Closure::new(move |vsync_ms: f64| {
-        let mut r = cell_loop.borrow_mut();
+        // An async anti-aliasing reconfig has taken the renderer out of the cell
+        // — skip the whole frame (never touch the renderer) and just reschedule.
+        if reconfiguring.get() {
+            if let Some(cb) = raf_run.borrow().as_ref() {
+                let _ =
+                    awsm_renderer::web_global::request_animation_frame(cb.as_ref().unchecked_ref());
+            }
+            return;
+        }
+        // A pending Settings anti-aliasing change: apply it off the render path.
+        // `set_anti_aliasing` + `commit_load` are async and recompile the new
+        // config's pipeline variants (cached, so a re-toggle is cheap). We take
+        // the renderer OUT of the cell for the awaits (so no RefCell borrow is
+        // held across them); the `reconfiguring` guard keeps every frame off the
+        // renderer until it's put back. `take()` coalesces rapid toggles.
+        if let Some((msaa, smaa)) = pending_aa.take() {
+            reconfiguring.set(true);
+            let cell = cell_loop.clone();
+            let done = reconfiguring.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let aa = awsm_renderer::anti_alias::AntiAliasing {
+                    msaa_sample_count: if msaa { Some(4) } else { None },
+                    smaa,
+                    mipmap: true,
+                };
+                // Own the renderer across the awaits (borrow released here).
+                let Some(mut renderer) = cell.borrow_mut().take() else {
+                    done.set(false);
+                    return;
+                };
+                if let Err(e) = renderer.set_anti_aliasing(aa).await {
+                    tracing::error!("render thread: set_anti_aliasing failed: {e:?}");
+                } else if let Err(e) = renderer.commit_load(|_| {}).await {
+                    tracing::error!("render thread: commit_load after AA change failed: {e:?}");
+                } else {
+                    tracing::info!(
+                        "render thread: anti-aliasing applied (msaa {msaa}, smaa {smaa})"
+                    );
+                }
+                *cell.borrow_mut() = Some(renderer);
+                done.set(false);
+            });
+            if let Some(cb) = raf_run.borrow().as_ref() {
+                let _ =
+                    awsm_renderer::web_global::request_animation_frame(cb.as_ref().unchecked_ref());
+            }
+            return;
+        }
+        let mut cell_ref = cell_loop.borrow_mut();
+        let Some(r) = cell_ref.as_mut() else {
+            // Renderer momentarily taken out for a reconfig — skip this frame.
+            if let Some(cb) = raf_run.borrow().as_ref() {
+                let _ =
+                    awsm_renderer::web_global::request_animation_frame(cb.as_ref().unchecked_ref());
+            }
+            return;
+        };
 
         // Advance the display cursor on the VSYNC clock, then gently trail
         // the newest published step (see the cursor's declaration comment).
@@ -787,9 +867,18 @@ fn install_render_input(
     balls: &'static BallMotions,
     floor: Option<([f32; 3], [f32; 3])>,
     ball_radius: f32,
+    pending_aa: Rc<Cell<Option<(bool, bool)>>>,
 ) -> Result<(), JsValue> {
     let scope = js_sys::global().unchecked_into::<web_sys::DedicatedWorkerGlobalScope>();
     let cb = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |e: web_sys::MessageEvent| {
+        // A Settings anti-aliasing toggle — stash it for the render loop to
+        // apply (it owns the renderer; we can't touch it from here).
+        if let Ok(QualityMsg::AntiAlias { msaa, smaa }) =
+            serde_wasm_bindgen::from_value::<QualityMsg>(e.data())
+        {
+            pending_aa.set(Some((msaa, smaa)));
+            return;
+        }
         // Canvas resize (main's ResizeObserver): apply the new device-pixel
         // backing size to the transferred OffscreenCanvas. The render loop
         // recomputes the camera aspect from the canvas every frame, and the
@@ -849,6 +938,34 @@ fn install_render_input(
     scope.set_onmessage(Some(cb.as_ref().unchecked_ref()));
     cb.forget();
     Ok(())
+}
+
+/// Probe the WebGPU adapter for the two facts main needs to size the canvas —
+/// whether it's a software fallback (start resolution low) and its max 2D
+/// texture dimension (the backing-store cap) — and post them to main. Failures
+/// degrade to safe defaults (not fallback, the WebGPU-guaranteed 8192 minimum).
+async fn report_gpu_info() {
+    use wasm_bindgen_futures::JsFuture;
+    let (is_fallback, max_texture_dim) = match awsm_renderer::web_global::navigator_gpu() {
+        Some(gpu) => match JsFuture::from(gpu.request_adapter()).await {
+            Ok(v) if !v.is_null() && !v.is_undefined() => {
+                let adapter: web_sys::GpuAdapter = v.unchecked_into();
+                (
+                    adapter.info().is_fallback_adapter(),
+                    adapter.limits().max_texture_dimension_2d(),
+                )
+            }
+            _ => (false, 8192),
+        },
+        None => (false, 8192),
+    };
+    tracing::info!(
+        "render thread: gpu info — fallback {is_fallback}, max_texture_2d {max_texture_dim}"
+    );
+    post_to_main(&RenderMsg::GpuInfo {
+        is_fallback,
+        max_texture_dim,
+    });
 }
 
 /// Post a human-readable load-progress line to main (the loading screen).

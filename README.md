@@ -1,4 +1,5 @@
-# single-player-game-physics
+# AWSM Template
+## Spatial audio and Multithreaded physics w/ Box3D
 
 **▶ [Live site](https://awsm.fun/experiments/box3d-multithreaded)** — the same
 build also deploys to GitHub Pages on every merge to `main`.

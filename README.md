@@ -1,9 +1,10 @@
 # AWSM Template
 ## Spatial audio and Multithreaded physics w/ Box3D
 
-**▶ [Live site](https://awsm.fun/experiments/box3d-multithreaded)** — the same
-build also deploys to GitHub Pages on every merge to `main`.
+## **▶ [Live site](https://awsm.fun/experiments/box3d-multithreaded)** 
+_the same build also deploys to GitHub Pages on every merge to `main`._
 
+----
 A copyable **template** from the [**Awsm**](https://awsm.fun) project: it
 *plays* a scene authored in the [scene editor](https://scene.awsm.fun),
 rendered with [`awsm-renderer`](https://crates.io/crates/awsm-renderer), with

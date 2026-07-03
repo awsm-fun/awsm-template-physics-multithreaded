@@ -590,6 +590,15 @@ pub enum RenderMsg {
     PhysicsInit(PhysicsInit),
     /// The first few frames have rendered — the sphere is on screen.
     Ready,
+    /// GPU capability facts the render worker learns at startup, so main can
+    /// seed the resolution scale and cap the backing store. `is_fallback` = a
+    /// software adapter (can't push pixels → main starts conservative);
+    /// `max_texture_dim` = the device's max 2D texture size (a huge display's
+    /// backing store can't exceed it). Posted once, before the scene load.
+    GpuInfo {
+        is_fallback: bool,
+        max_texture_dim: u32,
+    },
     /// Something failed in the render worker.
     Error { message: String },
 }
@@ -603,6 +612,20 @@ pub enum RenderMsg {
 #[serde(tag = "drop", rename_all = "kebab-case")]
 pub enum DropMsg {
     Ball { ndc_x: f32, ndc_y: f32 },
+}
+
+/// Main thread → render thread: a runtime quality change. Anti-aliasing is a
+/// renderer-*pipeline* setting — the MSAA sample count is baked into every
+/// render pipeline + its targets, and SMAA is a post pass compiled into the
+/// effects shader — so main can't apply it directly. It sends the desired flags
+/// and the render worker calls `set_anti_aliasing` + `commit_load` (which
+/// recompiles only the new config's variants; already-seen configs are cached,
+/// so toggling back is cheap). Cold path — one message per Settings toggle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "quality", rename_all = "kebab-case")]
+pub enum QualityMsg {
+    /// Enable/disable MSAA 4× and the SMAA post pass (independent toggles).
+    AntiAlias { msaa: bool, smaa: bool },
 }
 
 /// Main thread → render thread: the canvas element's size changed (main's

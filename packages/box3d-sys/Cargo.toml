@@ -1,0 +1,24 @@
+[package]
+name = "box3d-sys"
+description = "FFI bindings + wasm build of the vendored Box3D C library (vendor/box3d)."
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+
+# Transcendental float math (sinf/atan2f/…) for the wasm libc shim — these
+# have no wasm instruction, so the C objects' libcalls resolve to Rust libm.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+libm.workspace = true
+
+[build-dependencies]
+# Compiles the vendored C sources. On `wasm32-unknown-unknown` this uses the
+# wasm-capable clang discovered by build.rs (Apple clang has no wasm backend);
+# on host targets it uses the default toolchain so the FFI is natively testable.
+cc.workspace = true

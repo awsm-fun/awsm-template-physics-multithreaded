@@ -1,0 +1,18 @@
+# The ball↔ball collision "clack" DSP worklet — a standalone wasm artifact
+# attached to the audio project via the awsm-audio editor (like
+# audio-worklet-roll). Modal synthesis of two colliding steel spheres.
+# Build: cargo build -p audio-worklet-clack --target wasm32-unknown-unknown --release
+# Then attach: target/wasm32-unknown-unknown/release/audio_worklet_clack.wasm
+[package]
+name = "audio-worklet-clack"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+awsm-audio-worklet.workspace = true

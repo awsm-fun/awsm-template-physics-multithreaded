@@ -1,0 +1,1452 @@
+pan_x = 475.7578125
+pan_y = 100.5234375
+zoom = 1.0
+
+[library]
+version = 1
+root = "a24384ef-7bf0-4353-8060-0a3c294b9a46"
+
+[[library.samples]]
+id = "a24384ef-7bf0-4353-8060-0a3c294b9a46"
+name = "sfx_ball_roll"
+kind = "sound"
+
+[[library.samples.graph.nodes]]
+id = "a4c1ff0e-ccd0-46f6-8d94-9c8159f03a0e"
+label = "roll_LEVEL [CTRL gain=speed]"
+
+[library.samples.graph.nodes.kind]
+kind = "gain"
+
+[library.samples.graph.nodes.kind.props.gain]
+value = 0.6000000238418579
+
+[[library.samples.graph.nodes]]
+id = "d38ed814-0e3f-4e4b-a88e-0a4a5a758c41"
+label = "roll_PANNER [CTRL position_xyz]"
+
+[library.samples.graph.nodes.kind]
+kind = "panner"
+
+[library.samples.graph.nodes.kind.props]
+panning_model = "HRTF"
+distance_model = "inverse"
+ref_distance = 1.5
+max_distance = 60.0
+rolloff_factor = 1.0
+cone_inner_angle = 360.0
+cone_outer_angle = 360.0
+cone_outer_gain = 0.0
+
+[library.samples.graph.nodes.kind.props.position_x]
+value = 0.0
+
+[library.samples.graph.nodes.kind.props.position_y]
+value = 0.6000000238418579
+
+[library.samples.graph.nodes.kind.props.position_z]
+value = 0.0
+
+[library.samples.graph.nodes.kind.props.orientation_x]
+value = 1.0
+
+[library.samples.graph.nodes.kind.props.orientation_y]
+value = 0.0
+
+[library.samples.graph.nodes.kind.props.orientation_z]
+value = 0.0
+
+[[library.samples.graph.nodes]]
+id = "0a6431c9-8137-4b2d-a540-b9784cefe2ff"
+label = "roll_out"
+
+[library.samples.graph.nodes.kind]
+kind = "output"
+
+[library.samples.graph.nodes.kind.props.gain]
+value = 1.0
+
+[[library.samples.graph.nodes]]
+id = "21fb731d-b472-4a2d-9d44-9c3520bbc374"
+
+[library.samples.graph.nodes.kind]
+kind = "audio_worklet"
+
+[library.samples.graph.nodes.kind.props]
+module = "8709d208-b0ab-458d-9d70-1ae65b2dd56e"
+processor_name = "module"
+
+[[library.samples.graph.nodes.kind.props.parameters]]
+name = "speed"
+min = 0.0
+max = 1.0
+
+[library.samples.graph.nodes.kind.props.parameters.param]
+value = 0.4000000059604645
+
+[[library.samples.graph.nodes.kind.props.parameters]]
+name = "roughness"
+min = 0.0
+max = 1.0
+
+[library.samples.graph.nodes.kind.props.parameters.param]
+value = 0.5
+
+[[library.samples.graph.nodes.kind.props.parameters]]
+name = "body_hz"
+min = 40.0
+max = 320.0
+
+[library.samples.graph.nodes.kind.props.parameters.param]
+value = 110.0
+
+[[library.samples.graph.nodes.kind.props.parameters]]
+name = "brightness"
+min = 0.0
+max = 1.0
+
+[library.samples.graph.nodes.kind.props.parameters.param]
+value = 0.5
+
+[[library.samples.graph.nodes.kind.props.parameters]]
+name = "gain"
+min = 0.0
+max = 2.0
+
+[library.samples.graph.nodes.kind.props.parameters.param]
+value = 0.699999988079071
+
+[[library.samples.graph.connections]]
+
+[library.samples.graph.connections.from]
+from = "node_output"
+node = "a4c1ff0e-ccd0-46f6-8d94-9c8159f03a0e"
+output = 0
+
+[library.samples.graph.connections.to]
+to = "node_input"
+node = "d38ed814-0e3f-4e4b-a88e-0a4a5a758c41"
+input = 0
+
+[[library.samples.graph.connections]]
+
+[library.samples.graph.connections.from]
+from = "node_output"
+node = "d38ed814-0e3f-4e4b-a88e-0a4a5a758c41"
+output = 0
+
+[library.samples.graph.connections.to]
+to = "node_input"
+node = "0a6431c9-8137-4b2d-a540-b9784cefe2ff"
+input = 0
+
+[[library.samples.graph.connections]]
+
+[library.samples.graph.connections.from]
+from = "node_output"
+node = "21fb731d-b472-4a2d-9d44-9c3520bbc374"
+output = 0
+
+[library.samples.graph.connections.to]
+to = "node_input"
+node = "a4c1ff0e-ccd0-46f6-8d94-9c8159f03a0e"
+input = 0
+
+[library.samples.trigger]
+release = 0.0
+
+[library.samples.bounce]
+asset = "6d555e52-7016-4911-a272-fda0f57086e4"
+source_hash = 1224523453836735782
+
+[[library.samples]]
+id = "96707302-7b42-4f41-bdf0-3f200bc2f7cd"
+name = "sfx_wall_hit"
+kind = "sound"
+
+[[library.samples.graph.nodes]]
+id = "d9286788-572b-4d14-8e2c-d41ddeb88995"
+label = "hit_click_noise"
+
+[library.samples.graph.nodes.kind]
+kind = "noise"
+
+[library.samples.graph.nodes.kind.props]
+flavor = "white"
+seed = 4242
+seconds = 0.4000000059604645
+stereo = false
+density = 0.0
+gaussian = false
+
+[[library.samples.graph.nodes]]
+id = "209ddaed-46ec-4f1c-8374-3dc3722f4357"
+label = "hit_click_bp"
+
+[library.samples.graph.nodes.kind]
+kind = "biquad_filter"
+
+[library.samples.graph.nodes.kind.props]
+type = "bandpass"
+
+[library.samples.graph.nodes.kind.props.frequency]
+value = 900.0
+
+[library.samples.graph.nodes.kind.props.detune]
+value = 0.0
+
+[library.samples.graph.nodes.kind.props.Q]
+value = 0.800000011920929
+
+[library.samples.graph.nodes.kind.props.gain]
+value = 0.0
+
+[[library.samples.graph.nodes]]
+id = "6d77d50b-0b83-4973-962d-c29f2eb14d02"
+label = "hit_click_env"
+
+[library.samples.graph.nodes.kind]
+kind = "gain"
+
+[library.samples.graph.nodes.kind.props.gain]
+value = 0.0
+
+[[library.samples.graph.nodes.kind.props.gain.automation]]
+event = "set_value"
+
+[library.samples.graph.nodes.kind.props.gain.automation.args]
+value = 0.0
+time = 0.0
+
+[[library.samples.graph.nodes.kind.props.gain.automation]]
+event = "linear_ramp"
+
+[library.samples.graph.nodes.kind.props.gain.automation.args]
+value = 0.550000011920929
+time = 0.0006
+
+[[library.samples.graph.nodes.kind.props.gain.automation]]
+event = "exponential_ramp"
+
+[library.samples.graph.nodes.kind.props.gain.automation.args]
+value = 0.0007999999797903001
+time = 0.008
+
+[[library.samples.graph.nodes]]
+id = "10273ae4-b423-41ae-8a00-11cbd377e507"
+label = "hit_thump_osc 200>110"
+
+[library.samples.graph.nodes.kind]
+kind = "oscillator"
+
+[library.samples.graph.nodes.kind.props]
+type = "sine"
+
+[library.samples.graph.nodes.kind.props.frequency]
+value = 133.0
+
+[library.samples.graph.nodes.kind.props.detune]
+value = 0.0
+
+[[library.samples.graph.nodes]]
+id = "24361ad3-1cc3-4a12-bd4a-d355923dba9f"
+label = "hit_mode1_env"
+
+[library.samples.graph.nodes.kind]
+kind = "gain"
+
+[library.samples.graph.nodes.kind.props.gain]
+value = 0.0
+
+[[library.samples.graph.nodes.kind.props.gain.automation]]
+event = "set_value"
+
+[library.samples.graph.nodes.kind.props.gain.automation.args]
+value = 0.0
+time = 0.0
+
+[[library.samples.graph.nodes.kind.props.gain.automation]]
+event = "linear_ramp"
+
+[library.samples.graph.nodes.kind.props.gain.automation.args]
+value = 0.1599999964237213
+time = 0.0015
+
+[[library.samples.graph.nodes.kind.props.gain.automation]]
+event = "exponential_ramp"
+
+[library.samples.graph.nodes.kind.props.gain.automation.args]
+value = 0.0007999999797903001
+time = 0.06
+
+[[library.samples.graph.nodes]]
+id = "b6bad89b-b1c3-4f83-86c9-f2e3d3bb75c1"
+label = "hit_mode2_osc 300"
+
+[library.samples.graph.nodes.kind]
+kind = "oscillator"
+
+[library.samples.graph.nodes.kind.props]
+type = "sine"
+
+[library.samples.graph.nodes.kind.props.frequency]
+value = 333.0
+
+[library.samples.graph.nodes.kind.props.detune]
+value = 0.0
+
+[[library.samples.graph.nodes]]
+id = "7cfbe284-8320-4d83-98f1-66c6a1f1f7cd"
+label = "hit_mode2_env"
+
+[library.samples.graph.nodes.kind]
+kind = "gain"
+
+[library.samples.graph.nodes.kind.props.gain]
+value = 0.0
+
+[[library.samples.graph.nodes.kind.props.gain.automation]]
+event = "set_value"
+
+[library.samples.graph.nodes.kind.props.gain.automation.args]
+value = 0.0
+time = 0.0
+
+[[library.samples.graph.nodes.kind.props.gain.automation]]
+event = "linear_ramp"
+
+[library.samples.graph.nodes.kind.props.gain.automation.args]
+value = 0.30000001192092896
+time = 0.0015
+
+[[library.samples.graph.nodes.kind.props.gain.automation]]
+event = "exponential_ramp"
+
+[library.samples.graph.nodes.kind.props.gain.automation.args]
+value = 0.0007999999797903001
+time = 0.03
+
+[[library.samples.graph.nodes]]
+id = "beaeefd2-a2ec-4cad-a56e-95980e0d3c77"
+label = "hit_mode3_osc 540"
+
+[library.samples.graph.nodes.kind]
+kind = "oscillator"
+
+[library.samples.graph.nodes.kind.props]
+type = "sine"
+
+[library.samples.graph.nodes.kind.props.frequency]
+value = 560.0
+
+[library.samples.graph.nodes.kind.props.detune]
+value = 0.0
+
+[[library.samples.graph.nodes]]
+id = "5a272a25-8bf1-437a-86c0-2057f6ef849c"
+label = "hit_mode3_env"
+
+[library.samples.graph.nodes.kind]
+kind = "gain"
+
+[library.samples.graph.nodes.kind.props.gain]
+value = 0.0
+
+[[library.samples.graph.nodes.kind.props.gain.automation]]
+event = "set_value"
+
+[library.samples.graph.nodes.kind.props.gain.automation.args]
+value = 0.0
+time = 0.0
+
+[[library.samples.graph.nodes.kind.props.gain.automation]]
+event = "linear_ramp"
+
+[library.samples.graph.nodes.kind.props.gain.automation.args]
+value = 0.14000000059604645
+time = 0.001
+
+[[library.samples.graph.nodes.kind.props.gain.automation]]
+event = "exponential_ramp"
+
+[library.samples.graph.nodes.kind.props.gain.automation.args]
+value = 0.0007999999797903001
+time = 0.022
+
+[[library.samples.graph.nodes]]
+id = "fb91dd3c-d0a3-4a5d-83f6-0a6a45777494"
+label = "hit_mix"
+
+[library.samples.graph.nodes.kind]
+kind = "bus"
+
+[library.samples.graph.nodes.kind.props]
+gain = 1.0
+
+[[library.samples.graph.nodes]]
+id = "9f4f9037-538b-4e31-8022-c2f42913c1af"
+label = "hit_FILTER [CTRL frequency=hardness]"
+
+[library.samples.graph.nodes.kind]
+kind = "biquad_filter"
+
+[library.samples.graph.nodes.kind.props]
+type = "lowpass"
+
+[library.samples.graph.nodes.kind.props.frequency]
+value = 950.0
+
+[library.samples.graph.nodes.kind.props.detune]
+value = 0.0
+
+[library.samples.graph.nodes.kind.props.Q]
+value = 0.699999988079071
+
+[library.samples.graph.nodes.kind.props.gain]
+value = 0.0
+
+[[library.samples.graph.nodes]]
+id = "11ec6cb8-3d87-49c3-9e24-df8e122112ec"
+label = "hit_LEVEL [CTRL gain=impact]"
+
+[library.samples.graph.nodes.kind]
+kind = "gain"
+
+[library.samples.graph.nodes.kind.props.gain]
+value = 0.699999988079071
+
+[[library.samples.graph.nodes]]
+id = "658c7921-e7ec-4c99-b74d-6a7e4f548a8c"
+label = "hit_PANNER [CTRL position_xyz]"
+
+[library.samples.graph.nodes.kind]
+kind = "panner"
+
+[library.samples.graph.nodes.kind.props]
+panning_model = "HRTF"
+distance_model = "inverse"
+ref_distance = 1.5
+max_distance = 60.0
+rolloff_factor = 1.0
+cone_inner_angle = 360.0
+cone_outer_angle = 360.0
+cone_outer_gain = 0.0
+
+[library.samples.graph.nodes.kind.props.position_x]
+value = 0.0
+
+[library.samples.graph.nodes.kind.props.position_y]
+value = 0.4000000059604645
+
+[library.samples.graph.nodes.kind.props.position_z]
+value = 0.0
+
+[library.samples.graph.nodes.kind.props.orientation_x]
+value = 1.0
+
+[library.samples.graph.nodes.kind.props.orientation_y]
+value = 0.0
+
+[library.samples.graph.nodes.kind.props.orientation_z]
+value = 0.0
+
+[[library.samples.graph.nodes]]
+id = "e0305bab-61d4-4698-bbbc-fe4373849f72"
+label = "hit_out"
+
+[library.samples.graph.nodes.kind]
+kind = "output"
+
+[library.samples.graph.nodes.kind.props.gain]
+value = 1.0
+
+[[library.samples.graph.nodes]]
+id = "b7d13bc0-933b-4cb2-bd40-db670ddee0d9"
+label = "hit_thud_noise"
+
+[library.samples.graph.nodes.kind]
+kind = "noise"
+
+[library.samples.graph.nodes.kind.props]
+flavor = "brown"
+seed = 777
+seconds = 0.4000000059604645
+stereo = false
+density = 0.0
+gaussian = false
+
+[[library.samples.graph.nodes]]
+id = "4c44c57e-b02c-4587-a84e-fc43f6f56f3b"
+label = "hit_thud_lp"
+
+[library.samples.graph.nodes.kind]
+kind = "biquad_filter"
+
+[library.samples.graph.nodes.kind.props]
+type = "lowpass"
+
+[library.samples.graph.nodes.kind.props.frequency]
+value = 420.0
+
+[library.samples.graph.nodes.kind.props.detune]
+value = 0.0
+
+[library.samples.graph.nodes.kind.props.Q]
+value = 0.699999988079071
+
+[library.samples.graph.nodes.kind.props.gain]
+value = 0.0
+
+[[library.samples.graph.nodes]]
+id = "cde943e0-a4c3-4702-9418-0197bbd3a32c"
+label = "hit_thud_env"
+
+[library.samples.graph.nodes.kind]
+kind = "gain"
+
+[library.samples.graph.nodes.kind.props.gain]
+value = 0.0
+
+[[library.samples.graph.nodes.kind.props.gain.automation]]
+event = "set_value"
+
+[library.samples.graph.nodes.kind.props.gain.automation.args]
+value = 0.0
+time = 0.0
+
+[[library.samples.graph.nodes.kind.props.gain.automation]]
+event = "linear_ramp"
+
+[library.samples.graph.nodes.kind.props.gain.automation.args]
+value = 1.600000023841858
+time = 0.0012
+
+[[library.samples.graph.nodes.kind.props.gain.automation]]
+event = "exponential_ramp"
+
+[library.samples.graph.nodes.kind.props.gain.automation.args]
+value = 0.0007999999797903001
+time = 0.075
+
+[[library.samples.graph.connections]]
+
+[library.samples.graph.connections.from]
+from = "node_output"
+node = "d9286788-572b-4d14-8e2c-d41ddeb88995"
+output = 0
+
+[library.samples.graph.connections.to]
+to = "node_input"
+node = "209ddaed-46ec-4f1c-8374-3dc3722f4357"
+input = 0
+
+[[library.samples.graph.connections]]
+
+[library.samples.graph.connections.from]
+from = "node_output"
+node = "209ddaed-46ec-4f1c-8374-3dc3722f4357"
+output = 0
+
+[library.samples.graph.connections.to]
+to = "node_input"
+node = "6d77d50b-0b83-4973-962d-c29f2eb14d02"
+input = 0
+
+[[library.samples.graph.connections]]
+
+[library.samples.graph.connections.from]
+from = "node_output"
+node = "6d77d50b-0b83-4973-962d-c29f2eb14d02"
+output = 0
+
+[library.samples.graph.connections.to]
+to = "node_input"
+node = "fb91dd3c-d0a3-4a5d-83f6-0a6a45777494"
+input = 0
+
+[[library.samples.graph.connections]]
+
+[library.samples.graph.connections.from]
+from = "node_output"
+node = "10273ae4-b423-41ae-8a00-11cbd377e507"
+output = 0
+
+[library.samples.graph.connections.to]
+to = "node_input"
+node = "24361ad3-1cc3-4a12-bd4a-d355923dba9f"
+input = 0
+
+[[library.samples.graph.connections]]
+
+[library.samples.graph.connections.from]
+from = "node_output"
+node = "24361ad3-1cc3-4a12-bd4a-d355923dba9f"
+output = 0
+
+[library.samples.graph.connections.to]
+to = "node_input"
+node = "fb91dd3c-d0a3-4a5d-83f6-0a6a45777494"
+input = 0
+
+[[library.samples.graph.connections]]
+
+[library.samples.graph.connections.from]
+from = "node_output"
+node = "b6bad89b-b1c3-4f83-86c9-f2e3d3bb75c1"
+output = 0
+
+[library.samples.graph.connections.to]
+to = "node_input"
+node = "7cfbe284-8320-4d83-98f1-66c6a1f1f7cd"
+input = 0
+
+[[library.samples.graph.connections]]
+
+[library.samples.graph.connections.from]
+from = "node_output"
+node = "7cfbe284-8320-4d83-98f1-66c6a1f1f7cd"
+output = 0
+
+[library.samples.graph.connections.to]
+to = "node_input"
+node = "fb91dd3c-d0a3-4a5d-83f6-0a6a45777494"
+input = 0
+
+[[library.samples.graph.connections]]
+
+[library.samples.graph.connections.from]
+from = "node_output"
+node = "beaeefd2-a2ec-4cad-a56e-95980e0d3c77"
+output = 0
+
+[library.samples.graph.connections.to]
+to = "node_input"
+node = "5a272a25-8bf1-437a-86c0-2057f6ef849c"
+input = 0
+
+[[library.samples.graph.connections]]
+
+[library.samples.graph.connections.from]
+from = "node_output"
+node = "5a272a25-8bf1-437a-86c0-2057f6ef849c"
+output = 0
+
+[library.samples.graph.connections.to]
+to = "node_input"
+node = "fb91dd3c-d0a3-4a5d-83f6-0a6a45777494"
+input = 0
+
+[[library.samples.graph.connections]]
+
+[library.samples.graph.connections.from]
+from = "node_output"
+node = "fb91dd3c-d0a3-4a5d-83f6-0a6a45777494"
+output = 0
+
+[library.samples.graph.connections.to]
+to = "node_input"
+node = "9f4f9037-538b-4e31-8022-c2f42913c1af"
+input = 0
+
+[[library.samples.graph.connections]]
+
+[library.samples.graph.connections.from]
+from = "node_output"
+node = "9f4f9037-538b-4e31-8022-c2f42913c1af"
+output = 0
+
+[library.samples.graph.connections.to]
+to = "node_input"
+node = "11ec6cb8-3d87-49c3-9e24-df8e122112ec"
+input = 0
+
+[[library.samples.graph.connections]]
+
+[library.samples.graph.connections.from]
+from = "node_output"
+node = "11ec6cb8-3d87-49c3-9e24-df8e122112ec"
+output = 0
+
+[library.samples.graph.connections.to]
+to = "node_input"
+node = "658c7921-e7ec-4c99-b74d-6a7e4f548a8c"
+input = 0
+
+[[library.samples.graph.connections]]
+
+[library.samples.graph.connections.from]
+from = "node_output"
+node = "658c7921-e7ec-4c99-b74d-6a7e4f548a8c"
+output = 0
+
+[library.samples.graph.connections.to]
+to = "node_input"
+node = "e0305bab-61d4-4698-bbbc-fe4373849f72"
+input = 0
+
+[[library.samples.graph.connections]]
+
+[library.samples.graph.connections.from]
+from = "node_output"
+node = "b7d13bc0-933b-4cb2-bd40-db670ddee0d9"
+output = 0
+
+[library.samples.graph.connections.to]
+to = "node_input"
+node = "4c44c57e-b02c-4587-a84e-fc43f6f56f3b"
+input = 0
+
+[[library.samples.graph.connections]]
+
+[library.samples.graph.connections.from]
+from = "node_output"
+node = "4c44c57e-b02c-4587-a84e-fc43f6f56f3b"
+output = 0
+
+[library.samples.graph.connections.to]
+to = "node_input"
+node = "cde943e0-a4c3-4702-9418-0197bbd3a32c"
+input = 0
+
+[[library.samples.graph.connections]]
+
+[library.samples.graph.connections.from]
+from = "node_output"
+node = "cde943e0-a4c3-4702-9418-0197bbd3a32c"
+output = 0
+
+[library.samples.graph.connections.to]
+to = "node_input"
+node = "fb91dd3c-d0a3-4a5d-83f6-0a6a45777494"
+input = 0
+
+[library.samples.trigger]
+release = 0.0
+
+[library.samples.bounce]
+asset = "8acbb0dd-3988-4c65-9ac9-ceb4844fb88c"
+source_hash = 5926646038461057449
+
+[[library.samples]]
+id = "e5efc2de-eefe-45cd-a1f9-5262050b4788"
+name = "sfx_land"
+kind = "sound"
+
+[[library.samples.graph.nodes]]
+id = "c552a0e6-6b30-42f0-af31-a227732bb6d6"
+label = "land_thump_osc 110>55"
+
+[library.samples.graph.nodes.kind]
+kind = "oscillator"
+
+[library.samples.graph.nodes.kind.props]
+type = "sine"
+
+[library.samples.graph.nodes.kind.props.frequency]
+value = 110.0
+
+[[library.samples.graph.nodes.kind.props.frequency.automation]]
+event = "set_value"
+
+[library.samples.graph.nodes.kind.props.frequency.automation.args]
+value = 110.0
+time = 0.0
+
+[[library.samples.graph.nodes.kind.props.frequency.automation]]
+event = "exponential_ramp"
+
+[library.samples.graph.nodes.kind.props.frequency.automation.args]
+value = 55.0
+time = 0.09
+
+[library.samples.graph.nodes.kind.props.detune]
+value = 0.0
+
+[[library.samples.graph.nodes]]
+id = "2efb3eec-8a05-4c4d-84e6-ea125be83422"
+label = "land_thump_env"
+
+[library.samples.graph.nodes.kind]
+kind = "gain"
+
+[library.samples.graph.nodes.kind.props.gain]
+value = 0.0
+
+[[library.samples.graph.nodes.kind.props.gain.automation]]
+event = "set_value"
+
+[library.samples.graph.nodes.kind.props.gain.automation.args]
+value = 0.0
+time = 0.0
+
+[[library.samples.graph.nodes.kind.props.gain.automation]]
+event = "linear_ramp"
+
+[library.samples.graph.nodes.kind.props.gain.automation.args]
+value = 0.8999999761581421
+time = 0.004
+
+[[library.samples.graph.nodes.kind.props.gain.automation]]
+event = "exponential_ramp"
+
+[library.samples.graph.nodes.kind.props.gain.automation.args]
+value = 0.0007999999797903001
+time = 0.2
+
+[[library.samples.graph.nodes]]
+id = "f8e53c1b-f7a0-4720-8175-4010fe32a010"
+label = "land_body_noise"
+
+[library.samples.graph.nodes.kind]
+kind = "noise"
+
+[library.samples.graph.nodes.kind.props]
+flavor = "brown"
+seed = 909
+seconds = 0.5
+stereo = true
+density = 0.0
+gaussian = false
+
+[[library.samples.graph.nodes]]
+id = "defaac9c-a35f-471d-acb6-c6f376418fb9"
+label = "land_body_lp"
+
+[library.samples.graph.nodes.kind]
+kind = "biquad_filter"
+
+[library.samples.graph.nodes.kind.props]
+type = "lowpass"
+
+[library.samples.graph.nodes.kind.props.frequency]
+value = 320.0
+
+[library.samples.graph.nodes.kind.props.detune]
+value = 0.0
+
+[library.samples.graph.nodes.kind.props.Q]
+value = 0.699999988079071
+
+[library.samples.graph.nodes.kind.props.gain]
+value = 0.0
+
+[[library.samples.graph.nodes]]
+id = "fda350c3-fd2c-446c-ba10-0719273669ad"
+label = "land_body_env"
+
+[library.samples.graph.nodes.kind]
+kind = "gain"
+
+[library.samples.graph.nodes.kind.props.gain]
+value = 0.0
+
+[[library.samples.graph.nodes.kind.props.gain.automation]]
+event = "set_value"
+
+[library.samples.graph.nodes.kind.props.gain.automation.args]
+value = 0.0
+time = 0.0
+
+[[library.samples.graph.nodes.kind.props.gain.automation]]
+event = "linear_ramp"
+
+[library.samples.graph.nodes.kind.props.gain.automation.args]
+value = 0.5
+time = 0.003
+
+[[library.samples.graph.nodes.kind.props.gain.automation]]
+event = "exponential_ramp"
+
+[library.samples.graph.nodes.kind.props.gain.automation.args]
+value = 0.0007999999797903001
+time = 0.13
+
+[[library.samples.graph.nodes]]
+id = "ecb79fe1-52e6-403c-82c4-9d330603e19e"
+label = "land_mix"
+
+[library.samples.graph.nodes.kind]
+kind = "bus"
+
+[library.samples.graph.nodes.kind.props]
+gain = 1.0
+
+[[library.samples.graph.nodes]]
+id = "4b2d214c-4fa8-47d5-8eab-4cda725c5005"
+label = "land_FILTER [CTRL frequency=hardness]"
+
+[library.samples.graph.nodes.kind]
+kind = "biquad_filter"
+
+[library.samples.graph.nodes.kind.props]
+type = "lowpass"
+
+[library.samples.graph.nodes.kind.props.frequency]
+value = 500.0
+
+[library.samples.graph.nodes.kind.props.detune]
+value = 0.0
+
+[library.samples.graph.nodes.kind.props.Q]
+value = 0.699999988079071
+
+[library.samples.graph.nodes.kind.props.gain]
+value = 0.0
+
+[[library.samples.graph.nodes]]
+id = "56f24c17-4a22-43ea-bf17-ba2873db6605"
+label = "land_LEVEL [CTRL gain=impact]"
+
+[library.samples.graph.nodes.kind]
+kind = "gain"
+
+[library.samples.graph.nodes.kind.props.gain]
+value = 0.6800000071525574
+
+[[library.samples.graph.nodes]]
+id = "6a730073-2620-495c-a9b2-cb013a94149f"
+label = "land_PANNER [CTRL position_xyz]"
+
+[library.samples.graph.nodes.kind]
+kind = "panner"
+
+[library.samples.graph.nodes.kind.props]
+panning_model = "HRTF"
+distance_model = "inverse"
+ref_distance = 1.5
+max_distance = 60.0
+rolloff_factor = 1.0
+cone_inner_angle = 360.0
+cone_outer_angle = 360.0
+cone_outer_gain = 0.0
+
+[library.samples.graph.nodes.kind.props.position_x]
+value = 0.0
+
+[library.samples.graph.nodes.kind.props.position_y]
+value = 0.30000001192092896
+
+[library.samples.graph.nodes.kind.props.position_z]
+value = 0.0
+
+[library.samples.graph.nodes.kind.props.orientation_x]
+value = 1.0
+
+[library.samples.graph.nodes.kind.props.orientation_y]
+value = 0.0
+
+[library.samples.graph.nodes.kind.props.orientation_z]
+value = 0.0
+
+[[library.samples.graph.nodes]]
+id = "478d4a6d-3445-486b-aa43-740e07a2790a"
+label = "land_out"
+
+[library.samples.graph.nodes.kind]
+kind = "output"
+
+[library.samples.graph.nodes.kind.props.gain]
+value = 1.0
+
+[[library.samples.graph.connections]]
+
+[library.samples.graph.connections.from]
+from = "node_output"
+node = "c552a0e6-6b30-42f0-af31-a227732bb6d6"
+output = 0
+
+[library.samples.graph.connections.to]
+to = "node_input"
+node = "2efb3eec-8a05-4c4d-84e6-ea125be83422"
+input = 0
+
+[[library.samples.graph.connections]]
+
+[library.samples.graph.connections.from]
+from = "node_output"
+node = "2efb3eec-8a05-4c4d-84e6-ea125be83422"
+output = 0
+
+[library.samples.graph.connections.to]
+to = "node_input"
+node = "ecb79fe1-52e6-403c-82c4-9d330603e19e"
+input = 0
+
+[[library.samples.graph.connections]]
+
+[library.samples.graph.connections.from]
+from = "node_output"
+node = "f8e53c1b-f7a0-4720-8175-4010fe32a010"
+output = 0
+
+[library.samples.graph.connections.to]
+to = "node_input"
+node = "defaac9c-a35f-471d-acb6-c6f376418fb9"
+input = 0
+
+[[library.samples.graph.connections]]
+
+[library.samples.graph.connections.from]
+from = "node_output"
+node = "defaac9c-a35f-471d-acb6-c6f376418fb9"
+output = 0
+
+[library.samples.graph.connections.to]
+to = "node_input"
+node = "fda350c3-fd2c-446c-ba10-0719273669ad"
+input = 0
+
+[[library.samples.graph.connections]]
+
+[library.samples.graph.connections.from]
+from = "node_output"
+node = "fda350c3-fd2c-446c-ba10-0719273669ad"
+output = 0
+
+[library.samples.graph.connections.to]
+to = "node_input"
+node = "ecb79fe1-52e6-403c-82c4-9d330603e19e"
+input = 0
+
+[[library.samples.graph.connections]]
+
+[library.samples.graph.connections.from]
+from = "node_output"
+node = "ecb79fe1-52e6-403c-82c4-9d330603e19e"
+output = 0
+
+[library.samples.graph.connections.to]
+to = "node_input"
+node = "4b2d214c-4fa8-47d5-8eab-4cda725c5005"
+input = 0
+
+[[library.samples.graph.connections]]
+
+[library.samples.graph.connections.from]
+from = "node_output"
+node = "4b2d214c-4fa8-47d5-8eab-4cda725c5005"
+output = 0
+
+[library.samples.graph.connections.to]
+to = "node_input"
+node = "56f24c17-4a22-43ea-bf17-ba2873db6605"
+input = 0
+
+[[library.samples.graph.connections]]
+
+[library.samples.graph.connections.from]
+from = "node_output"
+node = "56f24c17-4a22-43ea-bf17-ba2873db6605"
+output = 0
+
+[library.samples.graph.connections.to]
+to = "node_input"
+node = "6a730073-2620-495c-a9b2-cb013a94149f"
+input = 0
+
+[[library.samples.graph.connections]]
+
+[library.samples.graph.connections.from]
+from = "node_output"
+node = "6a730073-2620-495c-a9b2-cb013a94149f"
+output = 0
+
+[library.samples.graph.connections.to]
+to = "node_input"
+node = "478d4a6d-3445-486b-aa43-740e07a2790a"
+input = 0
+
+[library.samples.trigger]
+release = 0.0
+
+[library.samples.bounce]
+asset = "a1295234-8525-421c-945f-ac7b98412ab7"
+source_hash = 5360252008017272232
+
+[[library.samples]]
+id = "2d092ba2-3f1f-4221-9e83-b343c720c9fc"
+name = "sfx_ball_clack"
+kind = "sound"
+
+[[library.samples.graph.nodes]]
+id = "926b6781-20fe-49c7-806d-4e428b21c755"
+label = "clack_WORKLET [CTRL intensity=impact speed]"
+
+[library.samples.graph.nodes.kind]
+kind = "audio_worklet"
+
+[library.samples.graph.nodes.kind.props]
+module = "763cd8f7-b603-46e0-b6e4-da6fa8a4db4a"
+processor_name = "clack"
+
+[[library.samples.graph.nodes.kind.props.parameters]]
+name = "intensity"
+min = 0.0
+max = 1.0
+
+[library.samples.graph.nodes.kind.props.parameters.param]
+value = 0.699999988079071
+
+[[library.samples.graph.nodes.kind.props.parameters]]
+name = "brightness"
+min = 0.0
+max = 1.0
+
+[library.samples.graph.nodes.kind.props.parameters.param]
+value = 0.5
+
+[[library.samples.graph.nodes.kind.props.parameters]]
+name = "ring"
+min = 0.25
+max = 2.0
+
+[library.samples.graph.nodes.kind.props.parameters.param]
+value = 1.0
+
+[[library.samples.graph.nodes]]
+id = "ee3c12f7-db2e-4495-a1a1-690147071619"
+label = "clack_LEVEL [CTRL gain=impact]"
+
+[library.samples.graph.nodes.kind]
+kind = "gain"
+
+[library.samples.graph.nodes.kind.props.gain]
+value = 0.699999988079071
+
+[[library.samples.graph.nodes]]
+id = "802a8d80-9163-41ea-ab48-ccd0be951b27"
+label = "clack_PANNER [CTRL position_xyz]"
+
+[library.samples.graph.nodes.kind]
+kind = "panner"
+
+[library.samples.graph.nodes.kind.props]
+panning_model = "HRTF"
+distance_model = "inverse"
+ref_distance = 1.5
+max_distance = 60.0
+rolloff_factor = 1.0
+cone_inner_angle = 360.0
+cone_outer_angle = 360.0
+cone_outer_gain = 0.0
+
+[library.samples.graph.nodes.kind.props.position_x]
+value = 0.0
+
+[library.samples.graph.nodes.kind.props.position_y]
+value = 0.4000000059604645
+
+[library.samples.graph.nodes.kind.props.position_z]
+value = 0.0
+
+[library.samples.graph.nodes.kind.props.orientation_x]
+value = 1.0
+
+[library.samples.graph.nodes.kind.props.orientation_y]
+value = 0.0
+
+[library.samples.graph.nodes.kind.props.orientation_z]
+value = 0.0
+
+[[library.samples.graph.nodes]]
+id = "7a31e870-86ea-431f-be6c-4d361453d23c"
+label = "clack_out"
+
+[library.samples.graph.nodes.kind]
+kind = "output"
+
+[library.samples.graph.nodes.kind.props.gain]
+value = 1.0
+
+[[library.samples.graph.connections]]
+
+[library.samples.graph.connections.from]
+from = "node_output"
+node = "926b6781-20fe-49c7-806d-4e428b21c755"
+output = 0
+
+[library.samples.graph.connections.to]
+to = "node_input"
+node = "ee3c12f7-db2e-4495-a1a1-690147071619"
+input = 0
+
+[[library.samples.graph.connections]]
+
+[library.samples.graph.connections.from]
+from = "node_output"
+node = "ee3c12f7-db2e-4495-a1a1-690147071619"
+output = 0
+
+[library.samples.graph.connections.to]
+to = "node_input"
+node = "802a8d80-9163-41ea-ab48-ccd0be951b27"
+input = 0
+
+[[library.samples.graph.connections]]
+
+[library.samples.graph.connections.from]
+from = "node_output"
+node = "802a8d80-9163-41ea-ab48-ccd0be951b27"
+output = 0
+
+[library.samples.graph.connections.to]
+to = "node_input"
+node = "7a31e870-86ea-431f-be6c-4d361453d23c"
+input = 0
+
+[library.samples.trigger]
+release = 0.0
+
+[library.samples.bounce]
+asset = "36d92fad-de18-4444-9a78-5bcad73169e3"
+source_hash = 2438224886260821231
+
+[[library.assets.buffers]]
+id = "6d555e52-7016-4911-a272-fda0f57086e4"
+label = "sfx_ball_roll (bounce)"
+
+[library.assets.buffers.source]
+kind = "path"
+data = "assets/6d555e52-7016-4911-a272-fda0f57086e4.wav"
+
+[[library.assets.buffers]]
+id = "8acbb0dd-3988-4c65-9ac9-ceb4844fb88c"
+label = "sfx_wall_hit (bounce)"
+
+[library.assets.buffers.source]
+kind = "path"
+data = "assets/8acbb0dd-3988-4c65-9ac9-ceb4844fb88c.wav"
+
+[[library.assets.buffers]]
+id = "a1295234-8525-421c-945f-ac7b98412ab7"
+label = "sfx_land (bounce)"
+
+[library.assets.buffers.source]
+kind = "path"
+data = "assets/a1295234-8525-421c-945f-ac7b98412ab7.wav"
+
+[[library.assets.buffers]]
+id = "36d92fad-de18-4444-9a78-5bcad73169e3"
+label = "sfx_ball_clack (bounce)"
+
+[library.assets.buffers.source]
+kind = "path"
+data = "assets/36d92fad-de18-4444-9a78-5bcad73169e3.wav"
+
+[[library.assets.wasm_modules]]
+id = "8709d208-b0ab-458d-9d70-1ae65b2dd56e"
+label = "module"
+
+[library.assets.wasm_modules.source]
+kind = "path"
+data = "assets/8709d208-b0ab-458d-9d70-1ae65b2dd56e.wasm"
+
+[[library.assets.wasm_modules]]
+id = "763cd8f7-b603-46e0-b6e4-da6fa8a4db4a"
+label = "clack"
+
+[library.assets.wasm_modules.source]
+kind = "path"
+data = "assets/763cd8f7-b603-46e0-b6e4-da6fa8a4db4a.wasm"
+
+[library.listener.position_x]
+value = 0.0
+
+[library.listener.position_y]
+value = 0.0
+
+[library.listener.position_z]
+value = 0.0
+
+[library.listener.forward_x]
+value = 0.0
+
+[library.listener.forward_y]
+value = 0.0
+
+[library.listener.forward_z]
+value = -1.0
+
+[library.listener.up_x]
+value = 0.0
+
+[library.listener.up_y]
+value = 1.0
+
+[library.listener.up_z]
+value = 0.0
+
+[[layout]]
+id = "a4c1ff0e-ccd0-46f6-8d94-9c8159f03a0e"
+x = -20.0
+y = 20.0
+
+[[layout]]
+id = "d38ed814-0e3f-4e4b-a88e-0a4a5a758c41"
+x = 160.0
+y = 20.0
+
+[[layout]]
+id = "0a6431c9-8137-4b2d-a540-b9784cefe2ff"
+x = 340.0
+y = 20.0
+
+[[layout]]
+id = "21fb731d-b472-4a2d-9d44-9c3520bbc374"
+x = -380.0
+y = 20.0
+
+[[layout]]
+id = "d9286788-572b-4d14-8e2c-d41ddeb88995"
+x = -560.0
+y = -200.0
+
+[[layout]]
+id = "209ddaed-46ec-4f1c-8374-3dc3722f4357"
+x = -380.0
+y = -200.0
+
+[[layout]]
+id = "6d77d50b-0b83-4973-962d-c29f2eb14d02"
+x = -200.0
+y = -200.0
+
+[[layout]]
+id = "10273ae4-b423-41ae-8a00-11cbd377e507"
+x = -560.0
+y = -60.0
+
+[[layout]]
+id = "24361ad3-1cc3-4a12-bd4a-d355923dba9f"
+x = -380.0
+y = -60.0
+
+[[layout]]
+id = "b6bad89b-b1c3-4f83-86c9-f2e3d3bb75c1"
+x = -560.0
+y = 60.0
+
+[[layout]]
+id = "7cfbe284-8320-4d83-98f1-66c6a1f1f7cd"
+x = -380.0
+y = 60.0
+
+[[layout]]
+id = "beaeefd2-a2ec-4cad-a56e-95980e0d3c77"
+x = -560.0
+y = 180.0
+
+[[layout]]
+id = "5a272a25-8bf1-437a-86c0-2057f6ef849c"
+x = -380.0
+y = 180.0
+
+[[layout]]
+id = "fb91dd3c-d0a3-4a5d-83f6-0a6a45777494"
+x = -200.0
+y = 0.0
+
+[[layout]]
+id = "9f4f9037-538b-4e31-8022-c2f42913c1af"
+x = -20.0
+y = 0.0
+
+[[layout]]
+id = "11ec6cb8-3d87-49c3-9e24-df8e122112ec"
+x = 160.0
+y = 0.0
+
+[[layout]]
+id = "658c7921-e7ec-4c99-b74d-6a7e4f548a8c"
+x = 340.0
+y = 0.0
+
+[[layout]]
+id = "e0305bab-61d4-4698-bbbc-fe4373849f72"
+x = 520.0
+y = 0.0
+
+[[layout]]
+id = "b7d13bc0-933b-4cb2-bd40-db670ddee0d9"
+x = -560.0
+y = 300.0
+
+[[layout]]
+id = "4c44c57e-b02c-4587-a84e-fc43f6f56f3b"
+x = -380.0
+y = 300.0
+
+[[layout]]
+id = "cde943e0-a4c3-4702-9418-0197bbd3a32c"
+x = -200.0
+y = 300.0
+
+[[layout]]
+id = "c552a0e6-6b30-42f0-af31-a227732bb6d6"
+x = -560.0
+y = -80.0
+
+[[layout]]
+id = "2efb3eec-8a05-4c4d-84e6-ea125be83422"
+x = -380.0
+y = -80.0
+
+[[layout]]
+id = "f8e53c1b-f7a0-4720-8175-4010fe32a010"
+x = -560.0
+y = 120.0
+
+[[layout]]
+id = "defaac9c-a35f-471d-acb6-c6f376418fb9"
+x = -380.0
+y = 120.0
+
+[[layout]]
+id = "fda350c3-fd2c-446c-ba10-0719273669ad"
+x = -200.0
+y = 120.0
+
+[[layout]]
+id = "ecb79fe1-52e6-403c-82c4-9d330603e19e"
+x = -40.0
+y = 20.0
+
+[[layout]]
+id = "4b2d214c-4fa8-47d5-8eab-4cda725c5005"
+x = 140.0
+y = 20.0
+
+[[layout]]
+id = "56f24c17-4a22-43ea-bf17-ba2873db6605"
+x = 320.0
+y = 20.0
+
+[[layout]]
+id = "6a730073-2620-495c-a9b2-cb013a94149f"
+x = 500.0
+y = 20.0
+
+[[layout]]
+id = "478d4a6d-3445-486b-aa43-740e07a2790a"
+x = 680.0
+y = 20.0
+
+[[layout]]
+id = "926b6781-20fe-49c7-806d-4e428b21c755"
+x = -400.0
+y = 0.0
+
+[[layout]]
+id = "ee3c12f7-db2e-4495-a1a1-690147071619"
+x = -180.0
+y = 0.0
+
+[[layout]]
+id = "802a8d80-9163-41ea-ab48-ccd0be951b27"
+x = 40.0
+y = 0.0
+
+[[layout]]
+id = "7a31e870-86ea-431f-be6c-4d361453d23c"
+x = 260.0
+y = 0.0

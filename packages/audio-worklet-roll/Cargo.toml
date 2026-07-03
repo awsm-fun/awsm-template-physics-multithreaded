@@ -1,0 +1,19 @@
+# The awsm-audio rolling-sound DSP worklet — a standalone wasm artifact the
+# game does NOT link: it's compiled to `.wasm` and attached to the audio
+# project via the awsm-audio editor's worklet toolchain (the shipped copy
+# lives in media/audio/assets/).
+# Build: cargo build -p audio-worklet-roll --target wasm32-unknown-unknown --release
+# Then attach: target/wasm32-unknown-unknown/release/audio_worklet_roll.wasm
+[package]
+name = "audio-worklet-roll"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+awsm-audio-worklet.workspace = true

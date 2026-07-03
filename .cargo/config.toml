@@ -1,0 +1,15 @@
+# Base cfgs for the wasm target so rust-analyzer / `cargo check` are happy.
+#
+# NOTE: the THREADED build (Taskfile.yml) sets a full RUSTFLAGS via env, which
+# *replaces* (does not append to) these. The Taskfile therefore repeats these
+# two cfgs verbatim on top of the +atomics/shared-memory link args. Keep them
+# in sync.
+[target.wasm32-unknown-unknown]
+rustflags = [
+    "--cfg=web_sys_unstable_apis",
+    "--cfg=getrandom_backend=\"wasm_js\"",
+]
+
+# Mirror the cfg on native targets so editor tooling doesn't error out.
+[target.'cfg(not(target_arch = "wasm32"))']
+rustflags = ["--cfg=web_sys_unstable_apis"]

@@ -1,0 +1,106 @@
+# Virtual workspace root — the crates live under packages/:
+#   frontend           — the game (main/render/physics threads + task pool);
+#                        Trunk builds it from packages/frontend
+#   box3d-sys          — FFI + wasm build of the vendored Box3D C library
+#   audio-worklet-roll — the rolling-sound DSP AudioWorklet (standalone wasm
+#                        artifact, attached via the awsm-audio editor)
+#
+# All dependency versions live HERE in [workspace.dependencies]; each member
+# pulls what it needs with `dep.workspace = true`.
+[workspace]
+resolver = "2"
+members = [
+    "packages/audio-worklet-clack",
+    "packages/audio-worklet-roll",
+    "packages/box3d-sys",
+    "packages/frontend",
+]
+
+[workspace.package]
+version = "0.1.0"
+authors = ["David Komer"]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+# ── in-workspace ─────────────────────────────────────────────────────────────
+box3d-sys = { path = "packages/box3d-sys" }
+
+# ── The renderer + the player-bundle loader ─────────────────────────────────
+# `awsm-renderer-scene` gives us the runtime `Scene` type + the `scene.toml`
+# deserializer; `awsm-renderer-scene-loader` runs the *player* load path
+# (`load_scene_for_player`) that a shipped game uses; `awsm-renderer-core`
+# exposes the WebGPU builder.
+awsm-renderer = "0.15.0"
+awsm-renderer-core = "0.15.0"
+awsm-renderer-scene = "0.15.0"
+awsm-renderer-scene-loader = { version = "0.15.0", features = ["http"] }
+
+# ── Audio (awsm-audio runtime) ───────────────────────────────────────────────
+# `awsm-audio-player` plays a saved awsm-audio project live; `awsm-audio-schema`
+# is its data model; `awsm-audio-worklet` is the worklet-side runtime the
+# rolling-sound DSP crate builds against. `toml` parses the exported
+# `project.toml` (the schema crate only derives serde).
+awsm-audio-player = "2.5"
+awsm-audio-schema = "2.5"
+awsm-audio-worklet = "2"
+toml = "0.8"
+
+# ── DOM, driven from pure Rust ──────────────────────────────────────────────
+# NOTE: the published dominator 0.5.38 is incompatible with
+# `web_sys_unstable_apis` — see [patch.crates-io] below.
+dominator = "0.5.38"
+futures-signals = "0.3"
+
+# ── glue ────────────────────────────────────────────────────────────────────
+# Pinned to the exact wasm-bindgen / web-sys / js-sys set awsm-renderer 0.15 is
+# built and tested against (and that the patched dominator works with).
+glam = "0.32"
+gloo-net = { version = "0.6", features = ["http"] }
+wasm-bindgen = "=0.2.118"
+wasm-bindgen-futures = "=0.4.68"
+js-sys = "=0.3.95"
+web-sys = "=0.3.95"
+serde = { version = "1", features = ["derive"] }
+serde-wasm-bindgen = "0.6"
+tracing = "0.1"
+tracing-web = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# ── build / shim deps ────────────────────────────────────────────────────────
+# cc compiles the vendored Box3D C; libm supplies the transcendentals the wasm
+# libc shim exports (no wasm instruction for sinf/atan2f/…).
+cc = "1"
+libm = "0.2"
+
+# Optimize *dependencies* even in dev builds. The renderer, Box3D, and especially
+# awsm-audio-player do heavy per-frame / per-trigger work that is unusably slow at
+# opt-level 0: the audio player's WebAudio graph build (run on every wall-hit /
+# landing) takes ~30-60ms unoptimized, blocking the main thread — and since input
+# is handled on the main thread, that surfaces as control lag during rapid play.
+# Optimized, the same build drops to a few ms. Our own crates stay at opt-level 0
+# for fast, debuggable incremental rebuilds.
+[profile.dev.package."*"]
+opt-level = 3
+
+# `package."*"` covers dependencies but NOT workspace members — and box3d-sys
+# is hot-path code: its C objects are always -O2 (pinned in build.rs), but the
+# Rust wasm shim (the allocator + libm wrappers every Box3D malloc/transcendental
+# funnels through, hundreds of times per step) would otherwise run at opt 0 in
+# dev. The frontend crate deliberately stays at opt 0 — its per-frame glue is
+# thin, and fast incremental rebuilds matter more there.
+[profile.dev.package.box3d-sys]
+opt-level = 3
+
+# Smaller, faster wasm in release (the bundle is multi-MB before this).
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+
+# dominator 0.5.38 (crates.io) won't compile under `web_sys_unstable_apis` — the
+# upstream git rev fixes the `f64` coord types. Same rev awsm-renderer pins.
+# Remove this once a fixed dominator is published to crates.io.
+[patch.crates-io]
+dominator = { git = "https://github.com/Pauan/rust-dominator", rev = "25597cd" }

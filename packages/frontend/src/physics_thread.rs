@@ -79,6 +79,10 @@ const MOVE_ACCEL: f32 = 27.0;
 const MAX_SPEED: f32 = 6.0;
 /// Launch velocity for a jump (also mass-scaled into an impulse).
 const JUMP_DV: f32 = 3.2;
+/// Cap on the horizontal speed a touch fling can set (m/s). Deliberately above
+/// [`MAX_SPEED`] so a hard flick reads as a real throw, but bounded so the
+/// ball can't be launched arbitrarily fast over the rails.
+const FLING_MAX: f32 = 9.0;
 /// Restitution/friction for the static table + walls.
 const STATIC_RESTITUTION: f32 = 0.5;
 const STATIC_FRICTION: f32 = 0.9;
@@ -316,6 +320,7 @@ pub fn start(payload: JsValue) -> Result<(), JsValue> {
     // leaked by the main thread for the session.
     let input: &'static InputState = unsafe { &*(init.input_ptr as usize as *const InputState) };
     let mut last_jump_seq = input.jump_seq();
+    let mut last_fling_seq = input.fling_seq();
 
     // Shapes the ball is currently touching (`other shape index1` → role),
     // maintained from begin/end contact events. Membership answers "grounded";
@@ -355,6 +360,10 @@ pub fn start(payload: JsValue) -> Result<(), JsValue> {
         let mut substeps: u32 = 0;
 
         while accumulator >= FIXED_DT_MS && substeps < MAX_SUBSTEPS {
+            // Whole-step CPU clock for the stats panel: input poll + solver
+            // step + event classification + pose publish (everything this
+            // iteration does), accumulated in the shared block as µs.
+            let body_t0 = perf.now();
             let mut teleported = false;
             tick = tick.wrapping_add(1);
             total_steps = total_steps.wrapping_add(1);
@@ -463,6 +472,26 @@ pub fn start(payload: JsValue) -> Result<(), JsValue> {
                         v3(0.0, JUMP_DV * ball_mass, 0.0),
                         true,
                     );
+                }
+                // Touch fling — edge-triggered like the jump. The swipe
+                // velocity arrives in the camera frame; rotate by the same yaw
+                // as the held keys, then SET the horizontal velocity: a throw
+                // should read as "the ball goes where I flicked, at the speed
+                // I flicked", not as a nudge on top of whatever motion it had.
+                // Vertical velocity is left alone (gravity / jumps).
+                if let Some((fx, fz)) = input.poll_fling(&mut last_fling_seq) {
+                    let yaw = input.camera_yaw();
+                    let (s, c) = yaw.sin_cos();
+                    let mut wx = fx * c + fz * s;
+                    let mut wz = -fx * s + fz * c;
+                    let speed_sq = wx * wx + wz * wz;
+                    if speed_sq > FLING_MAX * FLING_MAX {
+                        let k = FLING_MAX / speed_sq.sqrt();
+                        wx *= k;
+                        wz *= k;
+                    }
+                    let v = b3::b3Body_GetLinearVelocity(ball_body);
+                    b3::b3Body_SetLinearVelocity(ball_body, v3(wx, v.y, wz));
                 }
             }
 
@@ -639,6 +668,7 @@ pub fn start(payload: JsValue) -> Result<(), JsValue> {
             } else {
                 motion.publish(total_steps, pos, quat);
             }
+            motion.add_step_work_us(((perf.now() - body_t0) * 1000.0).max(0.0) as u32);
 
             accumulator -= FIXED_DT_MS;
             substeps += 1;

@@ -475,6 +475,14 @@ async fn run(
     // One arena binding per minted (dropped-ball) visual duplicate.
     let mut ball_bindings: Vec<awsm_renderer::buffer::shared_arena::SlotBinding> = Vec::new();
 
+    // Worker-scope `performance` for the frame-work clock. This is NOT frame
+    // pacing (the vsync timestamp does that) — it measures how long this
+    // thread's work takes, published for the stats panel's ms/frame line.
+    let perf = js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("performance"))
+        .ok()
+        .and_then(|p| p.dyn_into::<web_sys::Performance>().ok())
+        .ok_or_else(|| JsValue::from_str("render: no performance.now"))?;
+
     *raf_init.borrow_mut() = Some(Closure::new(move |vsync_ms: f64| {
         // An async anti-aliasing reconfig has taken the renderer out of the cell
         // — skip the whole frame (never touch the renderer) and just reschedule.
@@ -524,6 +532,8 @@ async fn run(
             }
             return;
         }
+        // Frame-work clock starts here — everything above is early-out paths.
+        let work_t0 = perf.now();
         let mut cell_ref = cell_loop.borrow_mut();
         let Some(r) = cell_ref.as_mut() else {
             // Renderer momentarily taken out for a reconfig — skip this frame.
@@ -642,6 +652,8 @@ async fn run(
         // Frame presented — wake physics to advance the sim for the next one, so
         // its step cadence stays locked to vsync (see `BodyMotion::bump_frame`).
         motion.bump_frame();
+        // Publish this frame's CPU cost (µs) for the stats panel's ms/frame.
+        motion.add_frame_work_us(((perf.now() - work_t0) * 1000.0).max(0.0) as u32);
 
         frame_count = frame_count.wrapping_add(1);
         if frame_count == 3 {

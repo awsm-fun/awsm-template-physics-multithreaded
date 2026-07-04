@@ -142,6 +142,9 @@ fn post_resize(render: &Worker, st: &ResState) {
 // builds with it off, so main applies it once on `Ready` — see that handler).
 const MSAA_STORAGE_KEY: &str = "awsm_msaa";
 const SMAA_STORAGE_KEY: &str = "awsm_smaa";
+/// `localStorage` key for the stats-panel toggle (default OFF — the panel eats
+/// a lot of a phone screen, so it's opt-in via the bottom-left Stats chip).
+const STATS_STORAGE_KEY: &str = "awsm_stats";
 const MSAA_DEFAULT: bool = true;
 const SMAA_DEFAULT: bool = true;
 /// The anti-aliasing config the renderer BUILDS with (`AntiAliasing::default`):
@@ -187,12 +190,18 @@ struct StatsRefs {
     pool: Option<(usize, u32)>,
 }
 
-/// Previous sample for rate computation (per-second deltas).
-#[derive(Default, Clone)]
+/// Previous stats sample: the counter values plus WHEN they were read
+/// (`performance.now()` ms). Rates divide by the real elapsed time between
+/// samples — never by the interval's nominal 1000 ms, which is a lie under
+/// timer jitter and background-tab throttling.
 struct StatsSample {
+    t: f64,
     frame: u32,
     step: u32,
-    claims: Vec<u32>,
+    frame_work_us: u32,
+    step_work_us: u32,
+    /// Per-executor accumulated task CPU µs (index 0 = the physics thread).
+    task_us: Vec<u32>,
 }
 
 /// Build + mount the DOM, then start the worker pipeline.
@@ -200,6 +209,13 @@ pub fn start() -> Result<(), JsValue> {
     let status = Mutable::new("booting…".to_string());
     let stats = Mutable::new(String::new());
     let about_open = Mutable::new(false);
+    // Stats panel visibility: OFF by default (it eats a lot of a phone
+    // screen); the bottom-left Stats chip toggles it and the choice persists.
+    let stats_open = Mutable::new(
+        web_sys::window()
+            .and_then(|w| stored_bool(&w, STATS_STORAGE_KEY))
+            .unwrap_or(false),
+    );
     loading_log("wasm compiled — main thread booting");
 
     let app = html!("div", {
@@ -214,21 +230,40 @@ pub fn start() -> Result<(), JsValue> {
         }))
         .child(html!("div", {
             .class("hud")
-            .text("single-player-game-physics\nW/A/S/D or arrows: roll · Space: jump · click: drop a ball\nright-drag: orbit · wheel: zoom\ntouch: drag to roll · tap to drop\nsound starts on your first key or click\n")
+            .text("single-player-game-physics\nW/A/S/D or arrows: roll · Space: jump · click: drop a ball\nright-drag: orbit · wheel: zoom\ntouch: swipe to fling the ball · tap to drop\nsound starts on your first key or click\n")
             .child(html!("span", {
                 .text_signal(status.signal_cloned())
             }))
         }))
         .child(html!("div", {
             .class("stats")
+            .visible_signal(stats_open.signal())
             .text_signal(stats.signal_cloned())
         }))
+        .child(stats_button(&stats_open))
         .child(about_button(&about_open))
         .child(about_modal(&about_open))
     });
 
     dominator::append_dom(&dominator::body(), app);
     Ok(())
+}
+
+/// The bottom-left "Stats" chip: toggles the top-right worker-stats panel
+/// (hidden by default). Persists the choice like the graphics settings.
+fn stats_button(open: &Mutable<bool>) -> dominator::Dom {
+    html!("button", {
+        .class("stats-btn")
+        .class_signal("active", open.signal())
+        .text("Stats")
+        .event(clone!(open => move |_: dominator::events::Click| {
+            let next = !open.get();
+            open.set_neq(next);
+            if let Some(w) = web_sys::window() {
+                store_bool(&w, STATS_STORAGE_KEY, next);
+            }
+        }))
+    })
 }
 
 /// The bottom-center "About" chip. Lives outside the canvas, so clicking it
@@ -316,7 +351,8 @@ fn about_modal(open: &Mutable<bool>) -> dominator::Dom {
                        the stereo image stay relative to your view from any angle.")
             }))
             .child(html!("p", {
-                .text("The stats panel (top right) shows each thread live. A \"task\" is \
+                .text("The stats panel (the Stats button, bottom left) shows each thread \
+                       live. A \"task\" is \
                        one slice of Box3D's internal parallel-for: every physics step, \
                        the solver splits its work into small tasks that the physics \
                        thread and the pool workers race to claim from shared memory — \
@@ -474,7 +510,10 @@ fn setup(
     // Shared-memory addresses the stats panel samples, filled in as workers
     // report them (PhysicsInit → motion/balls, SpawnTaskWorkers → pool).
     let stats_refs: Rc<RefCell<StatsRefs>> = Rc::new(RefCell::new(StatsRefs::default()));
-    install_stats(&window, stats, stats_refs.clone())?;
+    // Flipped by the `Ready` handler below: the stats warm-up doesn't even
+    // start until the renderer has committed and presented real frames.
+    let render_ready = Rc::new(Cell::new(false));
+    install_stats(&window, stats, stats_refs.clone(), render_ready.clone())?;
 
     // Shared handle to the physics worker (spawned later, once render hands us
     // the arena binding). We keep it only to hold the worker alive — input no
@@ -500,7 +539,7 @@ fn setup(
 
     // Handle messages coming back from the render worker.
     let on_render_msg = Closure::<dyn FnMut(MessageEvent)>::new(
-        clone!(physics, status, audio, stats_refs, res, user_pref, res_pct, msaa, smaa, render_ref => move |e: MessageEvent| {
+        clone!(physics, status, audio, stats_refs, res, user_pref, res_pct, msaa, smaa, render_ref, render_ready => move |e: MessageEvent| {
             match serde_wasm_bindgen::from_value::<RenderMsg>(e.data()) {
                 Ok(RenderMsg::Progress { message }) => {
                     loading_log(&message);
@@ -567,6 +606,8 @@ fn setup(
                 Ok(RenderMsg::Ready) => {
                     loading_log("first frames rendered — ready");
                     loading_done();
+                    // The stats warm-up clock starts here (real frames exist).
+                    render_ready.set(true);
                     status.set("playing — roll · Space jump · click drops a ball · right-drag orbit".into());
                     // Reconcile the renderer (which built with its own defaults)
                     // to the desired AA state — only send when they differ, so a
@@ -818,6 +859,30 @@ fn install_settings(
     Ok(())
 }
 
+// ── Touch fling tuning ───────────────────────────────────────────────────────
+/// CSS px a touch must travel before it counts as a swipe — under this it's a
+/// tap (→ the browser's click drops a ball).
+const TAP_SLOP_PX: f32 = 12.0;
+/// The release-velocity window (ms): the fling speed is measured from the
+/// oldest sample still inside this window to the lift point, so it captures
+/// the terminal flick of the gesture, not the whole drag's average.
+const FLING_WINDOW_MS: f64 = 120.0;
+/// Swipe speed (CSS px/s) → ball speed (m/s). A brisk phone flick lands around
+/// 1000–2500 px/s, i.e. 4–10 m/s before the physics-side cap.
+const FLING_GAIN: f32 = 0.004;
+/// Swipes slower than this (m/s) are ignored — a slow deliberate drag isn't a
+/// throw, and firing it would feel like phantom input.
+const FLING_MIN_SPEED: f32 = 0.25;
+
+/// Live tracking of the (single) touch pointer that may become a fling: where
+/// it started (tap-vs-swipe slop) and its recent move samples
+/// (`event.timeStamp` ms, x, y) for the release velocity.
+struct Swipe {
+    id: i32,
+    origin: (f32, f32),
+    samples: Vec<(f64, f32, f32)>,
+}
+
 /// Wire pointer input: a **left click drops a ball** — the click point goes to
 /// the render worker as a [`DropMsg`] in NDC (render owns the camera, so it
 /// does the unprojection onto the table). A **right-button drag orbits** and
@@ -825,6 +890,9 @@ fn install_settings(
 /// accumulates `yaw` here (same deltas × same sensitivity as the render
 /// thread's `OrbitCamera`) and fans it out to the shared [`InputState`]
 /// (camera-relative W/A/S/D) and the audio listener (camera-relative stereo).
+/// A **touch swipe flings the ball**: the swipe's release velocity becomes a
+/// camera-frame fling in the shared [`InputState`] (physics turns it into the
+/// ball's horizontal velocity); a short still touch stays a tap → drop.
 fn install_pointer(
     window: &web_sys::Window,
     canvas: &HtmlCanvasElement,
@@ -833,10 +901,19 @@ fn install_pointer(
     input: &'static InputState,
     yaw: Rc<Cell<f32>>,
 ) -> Result<(), JsValue> {
+    // Set when a touch swipe just flung the ball: the browser still
+    // synthesizes a `click` on the canvas after the pointer sequence, and a
+    // fling must not ALSO drop a ball. Consumed (reset) by the click handler.
+    let suppress_click = Rc::new(Cell::new(false));
+
     // Click → drop a ball at the clicked table spot. NDC: x right, y up.
     let click_canvas = canvas.clone();
     let click = Closure::<dyn FnMut(web_sys::MouseEvent)>::new(
-        clone!(render, audio => move |e: web_sys::MouseEvent| {
+        clone!(render, audio, suppress_click => move |e: web_sys::MouseEvent| {
+            // A swipe just ended — a fling is not a request for a new ball.
+            if suppress_click.take() {
+                return;
+            }
             // The click is also a user gesture — the first one starts audio,
             // so this very drop is audible.
             if let Some(c) = audio.borrow_mut().as_mut() {
@@ -856,27 +933,30 @@ fn install_pointer(
 
     let dragging = Rc::new(Cell::new(false));
 
-    // ── Touch steering (mobile) ─────────────────────────────────────────────
-    // A finger drag is a virtual stick: the vector from the touchdown point maps
-    // to the SAME held-direction bits WASD writes into the shared `InputState`,
-    // so physics needs no changes and the roll stays camera-relative (the camera
-    // is fixed on touch — no orbit — so screen-up = away = forward). We track the
-    // active pointer's id so a second finger can't hijack or cancel the steer.
-    // `Some((pointer_id, origin_x, origin_y))` in CSS px while a touch steers.
-    let touch = Rc::new(Cell::new(None::<(i32, f32, f32)>));
-    const MOVE_MASK: u32 = HELD_FORWARD | HELD_BACK | HELD_LEFT | HELD_RIGHT;
+    // ── Touch fling (mobile) ────────────────────────────────────────────────
+    // A swipe throws the ball: we track the active touch pointer's recent
+    // samples and, on lift, turn the end-of-swipe velocity into a camera-frame
+    // fling published through the shared `InputState` (physics rotates it by
+    // the camera yaw, same as W/A/S/D — screen-up = away = forward). Only the
+    // first finger is tracked, so a second finger can't hijack the gesture.
+    let swipe: Rc<RefCell<Option<Swipe>>> = Rc::new(RefCell::new(None));
 
     // pointerdown on the canvas: the RIGHT button begins an orbit drag (left
-    // stays the drop-a-ball click); a touch begins ball steering. Any button is
-    // a user gesture → start audio.
+    // stays the drop-a-ball click); a touch begins a possible swipe. Any
+    // button is a user gesture → start audio.
     let down = Closure::<dyn FnMut(web_sys::PointerEvent)>::new(
-        clone!(dragging, audio, touch => move |e: web_sys::PointerEvent| {
+        clone!(dragging, audio, swipe => move |e: web_sys::PointerEvent| {
             if e.button() == 2 {
                 dragging.set(true);
             }
-            // First finger down starts steering; ignore extra fingers.
-            if e.pointer_type() == "touch" && touch.get().is_none() {
-                touch.set(Some((e.pointer_id(), e.client_x() as f32, e.client_y() as f32)));
+            // First finger down starts the swipe track; ignore extra fingers.
+            if e.pointer_type() == "touch" && swipe.borrow().is_none() {
+                let (x, y) = (e.client_x() as f32, e.client_y() as f32);
+                *swipe.borrow_mut() = Some(Swipe {
+                    id: e.pointer_id(),
+                    origin: (x, y),
+                    samples: vec![(e.time_stamp(), x, y)],
+                });
             }
             if let Some(c) = audio.borrow_mut().as_mut() {
                 c.ensure_started();
@@ -900,19 +980,17 @@ fn install_pointer(
     // yaw with the same sensitivity — fanned out to physics (shared input
     // block) and the audio listener, keeping all three frames in lockstep.
     let move_ = Closure::<dyn FnMut(web_sys::PointerEvent)>::new(
-        clone!(dragging, render, audio, yaw, touch => move |e: web_sys::PointerEvent| {
-            // Touch steering: translate the drag vector into held-direction bits.
-            if let Some((id, ox, oy)) = touch.get() {
-                if e.pointer_id() == id {
-                    // Deadzone (CSS px) each axis must clear before it engages —
-                    // also what separates a steer from a tap (tap → drop a ball).
-                    const DEAD: f32 = 14.0;
-                    let dx = e.client_x() as f32 - ox;
-                    let dy = e.client_y() as f32 - oy;
-                    input.set_held(HELD_FORWARD, dy < -DEAD);
-                    input.set_held(HELD_BACK, dy > DEAD);
-                    input.set_held(HELD_LEFT, dx < -DEAD);
-                    input.set_held(HELD_RIGHT, dx > DEAD);
+        clone!(dragging, render, audio, yaw, swipe => move |e: web_sys::PointerEvent| {
+            // Touch swipe: record the sample; velocity is computed at lift.
+            if let Some(s) = swipe.borrow_mut().as_mut() {
+                if e.pointer_id() == s.id {
+                    let t = e.time_stamp();
+                    s.samples.push((t, e.client_x() as f32, e.client_y() as f32));
+                    // Prune to the release-velocity window, always keeping one
+                    // sample older than it as the measurement anchor.
+                    while s.samples.len() > 1 && t - s.samples[1].0 > FLING_WINDOW_MS {
+                        s.samples.remove(0);
+                    }
                     e.prevent_default();
                 }
                 return;
@@ -933,31 +1011,57 @@ fn install_pointer(
     window.add_event_listener_with_callback("pointermove", move_.as_ref().unchecked_ref())?;
     move_.forget();
 
-    // pointerup / pointercancel end the drag; a lifted (or interrupted) steering
-    // finger stops the roll by clearing every movement bit.
-    let end_touch = move |e: &web_sys::PointerEvent, touch: &Cell<Option<(i32, f32, f32)>>| {
-        if let Some((id, _, _)) = touch.get() {
-            if e.pointer_id() == id {
-                touch.set(None);
-                input.set_held(MOVE_MASK, false);
-            }
-        }
-    };
+    // pointerup ends the drag and resolves the swipe: past the tap slop it's a
+    // gesture (suppress the trailing click); fast enough, it's a fling — the
+    // end-of-swipe velocity goes to physics in the camera frame (screen-right
+    // = +x, screen-down = +z toward the camera, matching the held-key basis).
     let up = Closure::<dyn FnMut(web_sys::PointerEvent)>::new(
-        clone!(dragging, touch => move |e: web_sys::PointerEvent| {
+        clone!(dragging, swipe, suppress_click => move |e: web_sys::PointerEvent| {
             dragging.set(false);
-            end_touch(&e, &touch);
+            let ours = matches!(&*swipe.borrow(), Some(s) if s.id == e.pointer_id());
+            if !ours {
+                return;
+            }
+            let Some(s) = swipe.borrow_mut().take() else {
+                return;
+            };
+            let (lx, ly) = (e.client_x() as f32, e.client_y() as f32);
+            let travel =
+                ((lx - s.origin.0).powi(2) + (ly - s.origin.1).powi(2)).sqrt();
+            if travel < TAP_SLOP_PX {
+                return; // a tap — the browser's click follows and drops a ball
+            }
+            suppress_click.set(true);
+            // Velocity from the oldest in-window sample to the lift point.
+            let t = e.time_stamp();
+            let &(t0, x0, y0) = s
+                .samples
+                .iter()
+                .find(|(ts, _, _)| t - ts <= FLING_WINDOW_MS)
+                .unwrap_or(&s.samples[0]);
+            let dt = ((t - t0) / 1000.0) as f32;
+            if dt <= 0.0 {
+                return;
+            }
+            let vx = (lx - x0) / dt * FLING_GAIN;
+            let vz = (ly - y0) / dt * FLING_GAIN;
+            if (vx * vx + vz * vz).sqrt() >= FLING_MIN_SPEED {
+                input.bump_fling(vx, vz);
+            }
         }),
     );
     window.add_event_listener_with_callback("pointerup", up.as_ref().unchecked_ref())?;
     up.forget();
 
-    // A cancelled pointer (system gesture, finger slid off) must also stop the
-    // roll — otherwise the ball keeps rolling with no finger down.
+    // A cancelled pointer (system gesture, finger slid off) abandons the
+    // swipe — no fling from a gesture the user didn't finish.
     let cancel = Closure::<dyn FnMut(web_sys::PointerEvent)>::new(
-        clone!(dragging, touch => move |e: web_sys::PointerEvent| {
+        clone!(dragging, swipe => move |e: web_sys::PointerEvent| {
             dragging.set(false);
-            end_touch(&e, &touch);
+            let ours = matches!(&*swipe.borrow(), Some(s) if s.id == e.pointer_id());
+            if ours {
+                *swipe.borrow_mut() = None;
+            }
         }),
     );
     window.add_event_listener_with_callback("pointercancel", cancel.as_ref().unchecked_ref())?;
@@ -1038,60 +1142,208 @@ fn key_mask(key: &str) -> Option<u32> {
     }
 }
 
+/// EMA weight for the displayed fps / steps-per-second (per 1 s sample).
+/// High enough to converge in ~2–3 samples after a real change (a resolution
+/// drop, a heavy pile of balls), low enough to hold a rock-steady readout
+/// against per-sample noise.
+const STATS_EMA_ALPHA: f64 = 0.35;
+/// A rate window is only trusted between these bounds (ms). Below: two timer
+/// firings landed almost together (jitter) — the quotient would be noise.
+/// Above: the tab was throttled/hidden, so rAF wasn't running and the window
+/// measures the stall, not the framerate. Either way we re-baseline instead.
+const STATS_MIN_WINDOW_MS: f64 = 200.0;
+const STATS_MAX_WINDOW_MS: f64 = 3000.0;
+/// Frames that must present AFTER render reports `Ready` before counting
+/// starts. Boot isn't steady state — the loading overlay is fading, the
+/// startup SMAA reconcile recompiles pipelines (stalling frames right after
+/// `Ready`), caches are cold, the wasm engine is still tiering up — and those
+/// first samples read 2–3× the settled cost, polluting the EMAs with numbers
+/// the app never shows again. Counting frames (not wall time) means a stalled
+/// renderer keeps waiting instead of "warming up" through the stall.
+const STATS_WARMUP_FRAMES: u32 = 60;
+
 /// The top-right worker-stats panel: a 1 Hz `setInterval` that samples the
 /// shared-memory counters the workers already maintain — no messages, no new
-/// instrumentation. Rates are per-second deltas between samples:
-/// - render: presented frames (the `BodyMotion` frame-tick),
-/// - physics: fixed steps (the `BodyMotion` step counter),
-/// - each task-pool worker: solver tasks claimed (`TaskPool` claim counters;
-///   index 0 is the physics thread helping inside `finishTask`),
+/// instrumentation. Rates are counter deltas divided by the REAL elapsed time
+/// between samples (`performance.now()`), then EMA-smoothed — a nominal-1 Hz
+/// timer actually wobbles and gets throttled in background tabs, so assuming
+/// 1000 ms makes fps flicker and go absurd around a tab switch. On
+/// `visibilitychange` the baseline resets, so the hidden span (during which
+/// rAF doesn't run at all) is never turned into a bogus rate. Counting only
+/// begins `STATS_WARMUP_FRAMES` presented frames after render's `Ready` — see
+/// that constant for why boot samples are discarded. What's shown:
+/// - render: presented frames/s (the `BodyMotion` frame-tick). NOTE this is
+///   real presented fps, so it's vsync-capped — 60 on a 60 Hz display, 120 on
+///   a 120 Hz one; steady is the goal, not monitor-independent,
+/// - frame time: avg render-thread CPU ms per frame (`frame_work_us` delta
+///   over the frame delta) — the monitor-INDEPENDENT workload metric: what a
+///   frame actually costs, regardless of what refresh rate it's presented at,
+/// - physics time: avg physics-thread CPU ms per fixed step (same
+///   construction) — watch it grow as balls pile up; the budget at `SIM_HZ`
+///   240 is ~4.2 ms/step,
+/// - physics: fixed steps/s (locked to `SIM_HZ` when healthy),
+/// - physics pool / physics main: how the solver's task CPU time split this
+///   window between the pool workers and the physics thread help-executing in
+///   `finishTask` — a share of measured µs, not of task counts,
 /// - balls: `BallMotions` count.
 fn install_stats(
     window: &web_sys::Window,
     stats: Mutable<String>,
     refs: Rc<RefCell<StatsRefs>>,
+    render_ready: Rc<Cell<bool>>,
 ) -> Result<(), JsValue> {
-    let mut last = StatsSample::default();
+    let perf = window
+        .performance()
+        .ok_or_else(|| JsValue::from_str("no performance"))?;
+
+    // The previous sample. `None` forces a re-seed — at startup, and whenever
+    // the tab becomes visible again (shared with the visibility handler).
+    let baseline: Rc<RefCell<Option<StatsSample>>> = Rc::new(RefCell::new(None));
+    {
+        let baseline = baseline.clone();
+        let vis = Closure::<dyn FnMut()>::new(move || {
+            *baseline.borrow_mut() = None;
+        });
+        window
+            .document()
+            .ok_or_else(|| JsValue::from_str("no document"))?
+            .add_event_listener_with_callback("visibilitychange", vis.as_ref().unchecked_ref())?;
+        vis.forget();
+    }
+
+    let mut fps_ema: Option<f64> = None;
+    let mut steps_ema: Option<f64> = None;
+    let mut frame_work_ema: Option<f64> = None;
+    let mut step_work_ema: Option<f64> = None;
+    // The frame-tick value when `Ready` was first observed — counting starts
+    // `STATS_WARMUP_FRAMES` presented frames after it.
+    let mut warm_frame: Option<u32> = None;
     let tick = Closure::<dyn FnMut()>::new(move || {
         let refs = *refs.borrow();
-        let mut lines = String::from("workers\n");
-        lines.push_str("  main      ui · audio · input\n");
+        let now = perf.now();
 
-        // SAFETY (all three blocks): leaked-for-the-session allocations in the
-        // shared `WebAssembly.Memory`; we only read their atomics.
-        if let Some(addr) = refs.motion {
+        // Read the current counters (SAFETY, all blocks: leaked-for-the-session
+        // allocations in the shared `WebAssembly.Memory`; we only read atomics).
+        let motion_counts = refs.motion.map(|addr| {
             let motion = unsafe { &*(addr as *const BodyMotion) };
-            let frame = motion.frame_tick();
-            let step = motion.latest_step();
-            lines.push_str(&format!(
-                "  render    {} fps\n  physics   {} steps/s",
-                frame.wrapping_sub(last.frame),
-                step.wrapping_sub(last.step),
-            ));
-            last.frame = frame;
-            last.step = step;
-        } else {
-            lines.push_str("  render    starting…\n  physics   starting…");
-        }
-
-        if let Some((addr, count)) = refs.pool {
-            let pool = unsafe { &*(addr as *const TaskPool) };
-            let claims = pool.claim_counts(count as usize + 1);
-            last.claims.resize(claims.len(), 0);
-            for (i, (&now, then)) in claims.iter().zip(&last.claims).enumerate() {
-                let rate = now.wrapping_sub(*then);
-                let name = if i == 0 {
-                    "  physics⤷ ".to_string()
-                } else {
-                    format!("  task {i}    ")
-                };
-                if rate == 0 {
-                    lines.push_str(&format!("\n{name}idle"));
-                } else {
-                    lines.push_str(&format!("\n{name}{rate} tasks/s"));
-                }
+            (
+                motion.frame_tick(),
+                motion.latest_step(),
+                motion.frame_work_us(),
+                motion.step_work_us(),
+            )
+        });
+        let (frame, step, frame_work_us, step_work_us) = motion_counts.unwrap_or((0, 0, 0, 0));
+        let task_us = match refs.pool {
+            Some((addr, count)) => {
+                let pool = unsafe { &*(addr as *const TaskPool) };
+                pool.task_us_counts(count as usize + 1)
             }
-            last.claims.copy_from_slice(&claims);
+            None => Vec::new(),
+        };
+        let prev = baseline.borrow_mut().replace(StatsSample {
+            t: now,
+            frame,
+            step,
+            frame_work_us,
+            step_work_us,
+            task_us: task_us.clone(),
+        });
+
+        if motion_counts.is_none() {
+            fps_ema = None;
+            steps_ema = None;
+            frame_work_ema = None;
+            step_work_ema = None;
+            stats.set(
+                "workers\n  main          ui · audio · input\n  render        starting…\n  \
+                 physics       starting…"
+                    .to_string(),
+            );
+            return;
+        }
+        // Warm-up: don't count anything until render reported `Ready` AND
+        // `STATS_WARMUP_FRAMES` real frames have presented since. The baseline
+        // keeps refreshing above, so the first trusted window starts exactly
+        // where the warm-up ends.
+        if !render_ready.get() {
+            return; // still shows "starting…" from before
+        }
+        let base = *warm_frame.get_or_insert(frame);
+        if frame.wrapping_sub(base) < STATS_WARMUP_FRAMES {
+            stats.set(
+                "workers\n  main          ui · audio · input\n  render        warming up…\n  \
+                 physics       warming up…"
+                    .to_string(),
+            );
+            return;
+        }
+        // No trustworthy window (first sample, or a jittered/throttled gap):
+        // the baseline is re-seeded above — keep the last text on screen.
+        let Some(prev) =
+            prev.filter(|p| (STATS_MIN_WINDOW_MS..STATS_MAX_WINDOW_MS).contains(&(now - p.t)))
+        else {
+            return;
+        };
+        let dt = (now - prev.t) / 1000.0;
+
+        let frames = frame.wrapping_sub(prev.frame);
+        let steps = step.wrapping_sub(prev.step);
+        let fps = frames as f64 / dt;
+        let sps = steps as f64 / dt;
+        let f = fps_ema.get_or_insert(fps);
+        *f += (fps - *f) * STATS_EMA_ALPHA;
+        let s = steps_ema.get_or_insert(sps);
+        *s += (sps - *s) * STATS_EMA_ALPHA;
+        // Avg CPU ms per frame / per step over the window (needs a nonzero
+        // count to divide by — otherwise hold the previous smoothed value).
+        if frames > 0 {
+            let ms = frame_work_us.wrapping_sub(prev.frame_work_us) as f64 / frames as f64 / 1000.0;
+            let w = frame_work_ema.get_or_insert(ms);
+            *w += (ms - *w) * STATS_EMA_ALPHA;
+        }
+        if steps > 0 {
+            let ms = step_work_us.wrapping_sub(prev.step_work_us) as f64 / steps as f64 / 1000.0;
+            let w = step_work_ema.get_or_insert(ms);
+            *w += (ms - *w) * STATS_EMA_ALPHA;
+        }
+        let cpu = |ema: Option<f64>, digits: usize| match ema {
+            Some(w) => format!("{w:.digits$} ms"),
+            None => "—".to_string(),
+        };
+
+        let mut lines = String::from("workers\n  main          ui · audio · input\n");
+        lines.push_str(&format!(
+            "  render        {:.0} fps\n  frame time    {}\n  physics time  {}\n  \
+             physics       {:.0} steps/s",
+            *f,
+            cpu(frame_work_ema, 1),
+            cpu(step_work_ema, 2),
+            *s,
+        ));
+
+        // The solver's work split as a TRUE work share: each executor
+        // accumulates the CPU µs its claimed tasks took (`task_us_counts`;
+        // index 0 is the physics thread help-executing in `finishTask`), so a
+        // 500 µs task counts 100× a 5 µs one — unlike raw claim counts. The
+        // per-worker split is scheduler randomness, so only the pool-vs-main
+        // split is shown. Watch the pool's share grow as balls pile up.
+        if task_us.len() > 1 && prev.task_us.len() == task_us.len() {
+            let deltas: Vec<u64> = task_us
+                .iter()
+                .zip(&prev.task_us)
+                .map(|(&now, &then)| now.wrapping_sub(then) as u64)
+                .collect();
+            let total: u64 = deltas.iter().sum();
+            let workers = task_us.len() - 1;
+            let pool_pct = (deltas[1..].iter().sum::<u64>() * 100 + total / 2).checked_div(total);
+            lines.push_str(&match pool_pct {
+                Some(share) => format!(
+                    "\n  physics pool  {workers} workers · {share}%\n  physics main  {}%",
+                    100 - share
+                ),
+                None => format!("\n  physics pool  {workers} workers · idle\n  physics main  idle"),
+            });
         }
 
         if let Some(addr) = refs.balls {

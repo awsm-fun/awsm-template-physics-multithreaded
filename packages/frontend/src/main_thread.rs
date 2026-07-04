@@ -203,6 +203,18 @@ struct StatsRefs {
     pool: Option<(usize, u32)>,
 }
 
+/// The stats panel's renderable state: plain text above and below the sync
+/// line, plus the sync line itself with its health flag — split out so the
+/// DOM can color just that line red when sync is genuinely bad (see
+/// `install_stats` for what "bad" means).
+#[derive(Clone, Default)]
+struct StatsText {
+    head: String,
+    sync: String,
+    bad: bool,
+    tail: String,
+}
+
 /// Previous stats sample: the counter values plus WHEN they were read
 /// (`performance.now()` ms). Rates divide by the real elapsed time between
 /// samples — never by the interval's nominal 1000 ms, which is a lie under
@@ -253,7 +265,7 @@ pub fn start() -> Result<(), JsValue> {
         maybe_reset_settings(&window);
     }
     let status = Mutable::new("booting…".to_string());
-    let stats = Mutable::new(String::new());
+    let stats = Mutable::new(StatsText::default());
     let about_open = Mutable::new(false);
     // Stats panel visibility: OFF by default (it eats a lot of a phone
     // screen); the bottom-left Stats chip toggles it and the choice persists.
@@ -288,7 +300,14 @@ pub fn start() -> Result<(), JsValue> {
         .child(html!("div", {
             .class("stats")
             .visible_signal(stats_open.signal())
-            .text_signal(stats.signal_cloned())
+            // Three nodes so JUST the sync line can turn red when bad: the
+            // text above it, the sync line span, the text below it.
+            .text_signal(stats.signal_cloned().map(|s| s.head))
+            .child(html!("span", {
+                .class_signal("sync-bad", stats.signal_cloned().map(|s| s.bad))
+                .text_signal(stats.signal_cloned().map(|s| s.sync))
+            }))
+            .text_signal(stats.signal_cloned().map(|s| s.tail))
         }))
         .child(stats_button(&stats_open))
         .child(about_button(&about_open))
@@ -532,7 +551,7 @@ pub fn fatal(message: &str) {
 fn setup(
     canvas: HtmlCanvasElement,
     status: Mutable<String>,
-    stats: Mutable<String>,
+    stats: Mutable<StatsText>,
 ) -> Result<(), JsValue> {
     let window = web_sys::window().ok_or_else(|| JsValue::from_str("no window"))?;
 
@@ -1282,6 +1301,16 @@ const STATS_EMA_ALPHA: f64 = 0.35;
 /// measures the stall, not the framerate. Either way we re-baseline instead.
 const STATS_MIN_WINDOW_MS: f64 = 200.0;
 const STATS_MAX_WINDOW_MS: f64 = 3000.0;
+/// The sync line's "ROUGH" condition, part 1: the per-window worst display-
+/// cursor error (steps) that counts a window as rough…
+const SYNC_ROUGH_ERR: f32 = 3.0;
+/// …part 2: only while the adaptive lag is pinned at (essentially) its
+/// ceiling — below that the buffer still has headroom and will grow.
+const SYNC_ROUGH_LAG: f32 = 23.0;
+/// …part 3: consecutive rough windows before the line turns red. One spike
+/// is an event (tab switch, AA recompile); persistence is a condition.
+const SYNC_ROUGH_WINDOWS: u32 = 3;
+
 /// Frames that must present AFTER render reports `Ready` before counting
 /// starts. Boot isn't steady state — the loading overlay is fading, the
 /// startup SMAA reconcile recompiles pipelines (stalling frames right after
@@ -1311,18 +1340,21 @@ const STATS_WARMUP_FRAMES: u32 = 60;
 ///   construction) — watch it grow as balls pile up; the budget at `SIM_HZ`
 ///   240 is ~4.2 ms/step,
 /// - physics: fixed steps/s (locked to `SIM_HZ` when healthy),
-/// - sync: the window's max |display-cursor error| plus the current adaptive
-///   display lag, both in steps — the render/physics sync health. The lag
-///   grows to swallow bursty pose publishing (phone thread contention), so
-///   err should stay small everywhere; err repeatedly outrunning the lag
-///   means motion is visibly pulsing,
+/// - sync: render/physics sync health. Normally `ok · lag N` — N (steps) is
+///   the adaptive display lag, which grows to swallow bursty pose publishing
+///   (phone thread contention). It flips to a RED `ROUGH ±E · lag N` only
+///   when the condition is genuinely bad: the per-window worst cursor error
+///   stays ≥ [`SYNC_ROUGH_ERR`] steps for [`SYNC_ROUGH_WINDOWS`] consecutive
+///   windows while the lag is pinned at its ceiling — i.e. the jitter exceeds
+///   what the buffer may absorb and motion is visibly pulsing. One-off spikes
+///   (tab switch, AA recompile) never trip it — the lag grows and it's over,
 /// - physics pool / physics main: how the solver's task CPU time split this
 ///   window between the pool workers and the physics thread help-executing in
 ///   `finishTask` — a share of measured µs, not of task counts,
 /// - balls: `BallMotions` count.
 fn install_stats(
     window: &web_sys::Window,
-    stats: Mutable<String>,
+    stats: Mutable<StatsText>,
     refs: Rc<RefCell<StatsRefs>>,
     render_ready: Rc<Cell<bool>>,
 ) -> Result<(), JsValue> {
@@ -1349,6 +1381,9 @@ fn install_stats(
     let mut steps_ema: Option<f64> = None;
     let mut frame_work_ema: Option<f64> = None;
     let mut step_work_ema: Option<f64> = None;
+    // Consecutive windows the sync condition has been rough (see the doc
+    // comment's ROUGH definition) — the line turns red at the threshold.
+    let mut rough_windows: u32 = 0;
     // The frame-tick value when `Ready` was first observed — counting starts
     // `STATS_WARMUP_FRAMES` presented frames after it.
     let mut warm_frame: Option<u32> = None;
@@ -1394,11 +1429,12 @@ fn install_stats(
             steps_ema = None;
             frame_work_ema = None;
             step_work_ema = None;
-            stats.set(
-                "workers\n  main          ui · audio · input\n  render        starting…\n  \
-                 physics       starting…"
+            stats.set(StatsText {
+                head: "workers\n  main          ui · audio · input\n  render        \
+                       starting…\n  physics       starting…"
                     .to_string(),
-            );
+                ..StatsText::default()
+            });
             return;
         }
         // Warm-up: don't count anything until render reported `Ready` AND
@@ -1410,11 +1446,12 @@ fn install_stats(
         }
         let base = *warm_frame.get_or_insert(frame);
         if frame.wrapping_sub(base) < STATS_WARMUP_FRAMES {
-            stats.set(
-                "workers\n  main          ui · audio · input\n  render        warming up…\n  \
-                 physics       warming up…"
+            stats.set(StatsText {
+                head: "workers\n  main          ui · audio · input\n  render        \
+                       warming up…\n  physics       warming up…"
                     .to_string(),
-            );
+                ..StatsText::default()
+            });
             return;
         }
         // No trustworthy window (first sample, or a jittered/throttled gap):
@@ -1451,17 +1488,27 @@ fn install_stats(
             None => "—".to_string(),
         };
 
-        let mut lines = String::from("workers\n  main          ui · audio · input\n");
-        lines.push_str(&format!(
-            "  render        {:.0} fps\n  frame time    {}\n  physics time  {}\n  \
-             physics       {:.0} steps/s\n  sync          ±{:.1} · lag {:.0} steps",
+        let head = format!(
+            "workers\n  main          ui · audio · input\n  render        {:.0} fps\n  \
+             frame time    {}\n  physics time  {}\n  physics       {:.0} steps/s\n",
             *f,
             cpu(frame_work_ema, 1),
             cpu(step_work_ema, 2),
             *s,
-            sync_err,
-            lag,
-        ));
+        );
+        // Sync health (see the doc comment's ROUGH definition): rough = big
+        // worst-case error while the adaptive lag is already pinned at its
+        // ceiling; RED only when that persists across consecutive windows.
+        let rough_now = sync_err >= SYNC_ROUGH_ERR && lag >= SYNC_ROUGH_LAG;
+        rough_windows = if rough_now { rough_windows + 1 } else { 0 };
+        let bad = rough_windows >= SYNC_ROUGH_WINDOWS;
+        let sync = if bad {
+            format!("  sync          ROUGH ±{sync_err:.1} · lag {lag:.0}")
+        } else {
+            format!("  sync          ok · lag {lag:.0}")
+        };
+
+        let mut lines = String::new();
 
         // The solver's work split as a TRUE work share: each executor
         // accumulates the CPU µs its claimed tasks took (`task_us_counts`;
@@ -1492,7 +1539,12 @@ fn install_stats(
             lines.push_str(&format!("\n\nballs dropped  {}", balls.count()));
         }
 
-        stats.set(lines);
+        stats.set(StatsText {
+            head,
+            sync,
+            bad,
+            tail: lines,
+        });
     });
     window.set_interval_with_callback_and_timeout_and_arguments_0(
         tick.as_ref().unchecked_ref(),

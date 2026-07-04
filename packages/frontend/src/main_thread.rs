@@ -152,13 +152,18 @@ const SMAA_STORAGE_KEY: &str = "awsm_smaa";
 /// `localStorage` key for the stats-panel toggle (default OFF — the panel eats
 /// a lot of a phone screen, so it's opt-in via the bottom-left Stats chip).
 const STATS_STORAGE_KEY: &str = "awsm_stats";
-/// Default MSAA on a fine-pointer (desktop) device. On `pointer: coarse`
-/// devices the default is OFF instead: the same fill-rate ceiling that seeds
-/// [`COARSE_START_SCALE`] makes 4× multisampling the next-biggest GPU cost,
-/// and SMAA (cheap, still on) covers the aliasing at the reduced resolution.
-/// A stored user toggle always wins over either default.
+/// Default anti-aliasing on a fine-pointer (desktop) device. On
+/// `pointer: coarse` devices BOTH toggles default OFF instead: like the
+/// [`COARSE_START_SCALE`] resolution seed, the mobile defaults optimize
+/// purely for frame rate — and because that visibly costs quality, a
+/// one-time notice modal points the user at Settings (see
+/// `quality_notice_modal`). A stored user toggle always wins over either
+/// default.
 const MSAA_DEFAULT: bool = true;
 const SMAA_DEFAULT: bool = true;
+/// `localStorage` key marking the reduced-quality notice as already shown —
+/// it fires once per browser, not on every visit.
+const QUALITY_NOTICE_KEY: &str = "awsm_quality_notice";
 /// The anti-aliasing config the renderer BUILDS with (`AntiAliasing::default`):
 /// MSAA 4× on, SMAA off. The on-`Ready` reconcile compares the desired state
 /// against THIS (not the app defaults above) to decide whether a startup
@@ -274,6 +279,53 @@ fn stats_button(open: &Mutable<bool>) -> dominator::Dom {
             if let Some(w) = web_sys::window() {
                 store_bool(&w, STATS_STORAGE_KEY, next);
             }
+        }))
+    })
+}
+
+/// The one-time reduced-quality notice for touch devices: the coarse-pointer
+/// seeds (60% resolution, both anti-aliasing toggles off) trade visuals for
+/// frame rate, so the first time they apply we say so and point at Settings.
+/// Opened by the `Ready` handler (once the game is actually on screen);
+/// closes via OK, ×, backdrop, or Escape. Never shown again (persisted).
+fn quality_notice_modal(open: &Mutable<bool>) -> dominator::Dom {
+    html!("div", {
+        .class("settings-overlay")
+        .visible_signal(open.signal())
+        .event(clone!(open => move |e: dominator::events::Click| {
+            let on_backdrop = e
+                .dyn_target::<web_sys::Element>()
+                .map(|el| el.class_list().contains("settings-overlay"))
+                .unwrap_or(false);
+            if on_backdrop {
+                open.set_neq(false);
+            }
+        }))
+        .global_event(clone!(open => move |e: dominator::events::KeyDown| {
+            if e.key() == "Escape" {
+                open.set_neq(false);
+            }
+        }))
+        .child(html!("div", {
+            .class("settings-modal")
+            .child(html!("button", {
+                .class("about-close")
+                .attr("aria-label", "Close")
+                .text("×")
+                .event(clone!(open => move |_: dominator::events::Click| open.set_neq(false)))
+            }))
+            .child(html!("h2", { .text("Display Quality Reduced") }))
+            .child(html!("p", {
+                .class("notice-text")
+                .text("Display quality was reduced to keep the frame rate up on \
+                       touch devices. You can adjust the resolution and \
+                       anti-aliasing any time in Settings (bottom right).")
+            }))
+            .child(html!("button", {
+                .class("notice-ok")
+                .text("OK")
+                .event(clone!(open => move |_: dominator::events::Click| open.set_neq(false)))
+            }))
         }))
     })
 }
@@ -470,15 +522,32 @@ fn setup(
     let res_pct = Mutable::new(pct_of(res.get().scale));
     // Anti-aliasing toggles (persisted). Applied to the render worker once
     // it's ready (see the `Ready` handler) and on toggle. Like the resolution
-    // seed above, a coarse-pointer device defaults MSAA OFF — same fill-rate
-    // budget, and SMAA covers the aliasing at the reduced resolution.
-    let msaa_default = if coarse_pointer(&window) {
+    // seed above, a coarse-pointer device defaults BOTH off — the mobile
+    // seeds optimize purely for frame rate (a one-time notice modal below
+    // tells the user and points at Settings).
+    let coarse = coarse_pointer(&window);
+    let msaa = Mutable::new(stored_bool(&window, MSAA_STORAGE_KEY).unwrap_or(if coarse {
         false
     } else {
         MSAA_DEFAULT
-    };
-    let msaa = Mutable::new(stored_bool(&window, MSAA_STORAGE_KEY).unwrap_or(msaa_default));
-    let smaa = Mutable::new(stored_bool(&window, SMAA_STORAGE_KEY).unwrap_or(SMAA_DEFAULT));
+    }));
+    let smaa = Mutable::new(stored_bool(&window, SMAA_STORAGE_KEY).unwrap_or(if coarse {
+        false
+    } else {
+        SMAA_DEFAULT
+    }));
+    // ── Reduced-quality notice (touch devices) ──────────────────────────────
+    // If any of the coarse-device seeds actually applied (no stored user
+    // choice overrode it), quality was visibly traded for frame rate — say so
+    // ONCE, when the game first becomes visible (the `Ready` handler opens
+    // it), and point at Settings. `QUALITY_NOTICE_KEY` keeps it one-time.
+    let quality_reduced = coarse
+        && (stored_scale(&window).is_none()
+            || stored_bool(&window, MSAA_STORAGE_KEY).is_none()
+            || stored_bool(&window, SMAA_STORAGE_KEY).is_none());
+    let show_quality_notice = quality_reduced && stored_bool(&window, QUALITY_NOTICE_KEY).is_none();
+    let notice_open = Mutable::new(false);
+    dominator::append_dom(&dominator::body(), quality_notice_modal(&notice_open));
     let (w, h) = res.get().backing();
     canvas.set_width(w);
     canvas.set_height(h);
@@ -558,7 +627,7 @@ fn setup(
 
     // Handle messages coming back from the render worker.
     let on_render_msg = Closure::<dyn FnMut(MessageEvent)>::new(
-        clone!(physics, status, audio, stats_refs, res, user_pref, res_pct, msaa, smaa, render_ref, render_ready => move |e: MessageEvent| {
+        clone!(physics, status, audio, stats_refs, res, user_pref, res_pct, msaa, smaa, render_ref, render_ready, notice_open, window => move |e: MessageEvent| {
             match serde_wasm_bindgen::from_value::<RenderMsg>(e.data()) {
                 Ok(RenderMsg::Progress { message }) => {
                     loading_log(&message);
@@ -627,6 +696,12 @@ fn setup(
                     loading_done();
                     // The stats warm-up clock starts here (real frames exist).
                     render_ready.set(true);
+                    // The game is visible now — if this load applied the
+                    // reduced touch-device defaults, say so (once ever).
+                    if show_quality_notice {
+                        notice_open.set_neq(true);
+                        store_bool(&window, QUALITY_NOTICE_KEY, true);
+                    }
                     status.set("playing — roll · Space jump · click drops a ball · right-drag orbit".into());
                     // Reconcile the renderer (which built with its own defaults)
                     // to the desired AA state — only send when they differ, so a

@@ -1278,6 +1278,11 @@ const STATS_WARMUP_FRAMES: u32 = 60;
 ///   construction) — watch it grow as balls pile up; the budget at `SIM_HZ`
 ///   240 is ~4.2 ms/step,
 /// - physics: fixed steps/s (locked to `SIM_HZ` when healthy),
+/// - sync: the window's max |display-cursor error| in steps — the
+///   render/physics sync health. The interpolation cursor budgets
+///   `TARGET_LAG` (2) steps of wobble; sustained readings beyond that mean
+///   pose publishing is bursty (thread contention) and motion visibly
+///   pulses,
 /// - physics pool / physics main: how the solver's task CPU time split this
 ///   window between the pool workers and the physics thread help-executing in
 ///   `finishTask` — a share of measured µs, not of task counts,
@@ -1327,9 +1332,13 @@ fn install_stats(
                 motion.latest_step(),
                 motion.frame_work_us(),
                 motion.step_work_us(),
+                // Read-and-reset every tick (even during warm-up) so the
+                // boot spike drains before the first displayed window.
+                motion.take_sync_err(),
             )
         });
-        let (frame, step, frame_work_us, step_work_us) = motion_counts.unwrap_or((0, 0, 0, 0));
+        let (frame, step, frame_work_us, step_work_us, sync_err) =
+            motion_counts.unwrap_or((0, 0, 0, 0, 0.0));
         let task_us = match refs.pool {
             Some((addr, count)) => {
                 let pool = unsafe { &*(addr as *const TaskPool) };
@@ -1411,11 +1420,12 @@ fn install_stats(
         let mut lines = String::from("workers\n  main          ui · audio · input\n");
         lines.push_str(&format!(
             "  render        {:.0} fps\n  frame time    {}\n  physics time  {}\n  \
-             physics       {:.0} steps/s",
+             physics       {:.0} steps/s\n  sync          ±{:.1} steps",
             *f,
             cpu(frame_work_ema, 1),
             cpu(step_work_ema, 2),
             *s,
+            sync_err,
         ));
 
         // The solver's work split as a TRUE work share: each executor

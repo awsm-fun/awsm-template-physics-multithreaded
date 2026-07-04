@@ -565,6 +565,8 @@ async fn run(
             latest as f64,
         );
         sync_stats.record(steps_this_frame, err as f32);
+        // Publish the |error| for the stats panel's sync-health line.
+        motion.note_sync_err(err.abs() as f32);
 
         let (pos, rot) = sample_ring(motion.ring(), display_step);
         // Bake the ball mesh's authored scale in (the arena slot is the absolute

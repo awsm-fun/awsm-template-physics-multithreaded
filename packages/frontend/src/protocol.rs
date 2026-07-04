@@ -348,6 +348,14 @@ pub struct BodyMotion {
     /// classification, pose publish — summed across steps. The stats panel
     /// divides its delta by the step-count delta for avg ms/step.
     step_work_us: AtomicU32,
+    /// Running max of the display cursor's |re-anchor error| (steps, `f32`
+    /// bits — IEEE ordering matches `u32` for non-negatives, so `fetch_max`
+    /// on the bits is max on the value). Render records it per frame; the
+    /// stats panel reads-and-resets. This is the render/physics sync-health
+    /// number: sustained values beyond the cursor's jitter budget
+    /// (`TARGET_LAG` steps) mean the interpolation is ramming its rails and
+    /// motion visibly pulses.
+    sync_err_bits: AtomicU32,
 }
 
 impl BodyMotion {
@@ -358,7 +366,20 @@ impl BodyMotion {
             frame_tick: AtomicU32::new(0),
             frame_work_us: AtomicU32::new(0),
             step_work_us: AtomicU32::new(0),
+            sync_err_bits: AtomicU32::new(0),
         }
+    }
+
+    /// Render side: record this frame's display-cursor |error| (steps).
+    pub fn note_sync_err(&self, err_abs: f32) {
+        self.sync_err_bits
+            .fetch_max(err_abs.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Stats side: the max |cursor error| (steps) since the last call, which
+    /// resets the running max to zero.
+    pub fn take_sync_err(&self) -> f32 {
+        f32::from_bits(self.sync_err_bits.swap(0, Ordering::Relaxed))
     }
 
     /// Render side: add one frame's CPU work time (µs) to the running total.

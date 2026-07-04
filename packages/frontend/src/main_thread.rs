@@ -97,17 +97,24 @@ fn initial_scale(window: &web_sys::Window) -> f64 {
     if let Some(stored) = stored_scale(window) {
         return stored;
     }
-    let coarse = window
-        .match_media("(pointer: coarse)")
-        .ok()
-        .flatten()
-        .map(|m| m.matches())
-        .unwrap_or(false);
-    if coarse {
+    if coarse_pointer(window) {
         COARSE_START_SCALE
     } else {
         MAX_SCALE
     }
+}
+
+/// A touch / `pointer: coarse` device (phones, tablets) — the device class
+/// that seeds lower graphics defaults: the resolution scale starts at
+/// [`COARSE_START_SCALE`] and MSAA starts off. Only DEFAULTS — a stored user
+/// choice always wins.
+fn coarse_pointer(window: &web_sys::Window) -> bool {
+    window
+        .match_media("(pointer: coarse)")
+        .ok()
+        .flatten()
+        .map(|m| m.matches())
+        .unwrap_or(false)
 }
 
 /// The persisted resolution scale, if the user has set one (clamped to range).
@@ -145,6 +152,12 @@ const SMAA_STORAGE_KEY: &str = "awsm_smaa";
 /// `localStorage` key for the stats-panel toggle (default OFF — the panel eats
 /// a lot of a phone screen, so it's opt-in via the bottom-left Stats chip).
 const STATS_STORAGE_KEY: &str = "awsm_stats";
+/// Default anti-aliasing on a fine-pointer (desktop) device. On
+/// `pointer: coarse` devices BOTH toggles default OFF instead: like the
+/// [`COARSE_START_SCALE`] resolution seed, the mobile defaults optimize
+/// purely for frame rate — and because that visibly costs quality, a notice
+/// modal points the user at Settings (see `quality_notice_modal`). A stored
+/// user toggle always wins over either default.
 const MSAA_DEFAULT: bool = true;
 const SMAA_DEFAULT: bool = true;
 /// The anti-aliasing config the renderer BUILDS with (`AntiAliasing::default`):
@@ -190,6 +203,18 @@ struct StatsRefs {
     pool: Option<(usize, u32)>,
 }
 
+/// The stats panel's renderable state: plain text above and below the sync
+/// line, plus the sync line itself with its health flag — split out so the
+/// DOM can color just that line red when sync is genuinely bad (see
+/// `install_stats` for what "bad" means).
+#[derive(Clone, Default)]
+struct StatsText {
+    head: String,
+    sync: String,
+    bad: bool,
+    tail: String,
+}
+
 /// Previous stats sample: the counter values plus WHEN they were read
 /// (`performance.now()` ms). Rates divide by the real elapsed time between
 /// samples — never by the interval's nominal 1000 ms, which is a lie under
@@ -204,16 +229,53 @@ struct StatsSample {
     task_us: Vec<u32>,
 }
 
+/// `?reset` in the URL wipes every persisted app setting (resolution, MSAA,
+/// SMAA, stats toggle) so the load boots with fresh defaults — the escape
+/// hatch when a device carries choices from old sessions (which override the
+/// device-class seeds and suppress the reduced-quality notice) and the
+/// browser's site-data UI won't surface them. Must run before ANY stored
+/// value is read, i.e. first thing in [`start`].
+fn maybe_reset_settings(window: &web_sys::Window) {
+    let has_reset = window
+        .location()
+        .search()
+        .ok()
+        .and_then(|s| web_sys::UrlSearchParams::new_with_str(&s).ok())
+        .map(|p| p.get("reset").is_some())
+        .unwrap_or(false);
+    if !has_reset {
+        return;
+    }
+    if let Ok(Some(ls)) = window.local_storage() {
+        for key in [
+            RES_STORAGE_KEY,
+            MSAA_STORAGE_KEY,
+            SMAA_STORAGE_KEY,
+            STATS_STORAGE_KEY,
+        ] {
+            let _ = ls.remove_item(key);
+        }
+    }
+    loading_log("?reset — stored settings cleared, booting with defaults");
+}
+
 /// Build + mount the DOM, then start the worker pipeline.
 pub fn start() -> Result<(), JsValue> {
+    if let Some(window) = web_sys::window() {
+        maybe_reset_settings(&window);
+    }
     let status = Mutable::new("booting…".to_string());
-    let stats = Mutable::new(String::new());
+    let stats = Mutable::new(StatsText::default());
     let about_open = Mutable::new(false);
     // Stats panel visibility: OFF by default (it eats a lot of a phone
     // screen); the bottom-left Stats chip toggles it and the choice persists.
+    // Never auto-open on a coarse device, even if a stored "open" flag says
+    // to — the panel eats a phone screen (the whole reason it's opt-in). The
+    // chip still toggles it within the session; the persisted choice only
+    // restores on fine-pointer (desktop) devices.
     let stats_open = Mutable::new(
         web_sys::window()
-            .and_then(|w| stored_bool(&w, STATS_STORAGE_KEY))
+            .map(|w| !coarse_pointer(&w) && stored_bool(&w, STATS_STORAGE_KEY).unwrap_or(false))
             .unwrap_or(false),
     );
     loading_log("wasm compiled — main thread booting");
@@ -238,7 +300,14 @@ pub fn start() -> Result<(), JsValue> {
         .child(html!("div", {
             .class("stats")
             .visible_signal(stats_open.signal())
-            .text_signal(stats.signal_cloned())
+            // Three nodes so JUST the sync line can turn red when bad: the
+            // text above it, the sync line span, the text below it.
+            .text_signal(stats.signal_cloned().map(|s| s.head))
+            .child(html!("span", {
+                .class_signal("sync-bad", stats.signal_cloned().map(|s| s.bad))
+                .text_signal(stats.signal_cloned().map(|s| s.sync))
+            }))
+            .text_signal(stats.signal_cloned().map(|s| s.tail))
         }))
         .child(stats_button(&stats_open))
         .child(about_button(&about_open))
@@ -262,6 +331,55 @@ fn stats_button(open: &Mutable<bool>) -> dominator::Dom {
             if let Some(w) = web_sys::window() {
                 store_bool(&w, STATS_STORAGE_KEY, next);
             }
+        }))
+    })
+}
+
+/// The one-time reduced-quality notice for touch devices: the coarse-pointer
+/// seeds (60% resolution, both anti-aliasing toggles off) trade visuals for
+/// frame rate, so the first time they apply we say so and point at Settings.
+/// Opened by the `Ready` handler (once the game is actually on screen);
+/// closes via OK, ×, backdrop, or Escape. Shows on every load where the
+/// seeds applied; it stops once the user makes their own Settings choices
+/// (those persist and replace the seeds).
+fn quality_notice_modal(open: &Mutable<bool>) -> dominator::Dom {
+    html!("div", {
+        .class("settings-overlay")
+        .visible_signal(open.signal())
+        .event(clone!(open => move |e: dominator::events::Click| {
+            let on_backdrop = e
+                .dyn_target::<web_sys::Element>()
+                .map(|el| el.class_list().contains("settings-overlay"))
+                .unwrap_or(false);
+            if on_backdrop {
+                open.set_neq(false);
+            }
+        }))
+        .global_event(clone!(open => move |e: dominator::events::KeyDown| {
+            if e.key() == "Escape" {
+                open.set_neq(false);
+            }
+        }))
+        .child(html!("div", {
+            .class("settings-modal")
+            .child(html!("button", {
+                .class("about-close")
+                .attr("aria-label", "Close")
+                .text("×")
+                .event(clone!(open => move |_: dominator::events::Click| open.set_neq(false)))
+            }))
+            .child(html!("h2", { .text("Display Quality Reduced") }))
+            .child(html!("p", {
+                .class("notice-text")
+                .text("Display quality was reduced to keep the frame rate up on \
+                       touch devices. You can adjust the resolution and \
+                       anti-aliasing any time in Settings (bottom right).")
+            }))
+            .child(html!("button", {
+                .class("notice-ok")
+                .text("OK")
+                .event(clone!(open => move |_: dominator::events::Click| open.set_neq(false)))
+            }))
         }))
     })
 }
@@ -433,7 +551,7 @@ pub fn fatal(message: &str) {
 fn setup(
     canvas: HtmlCanvasElement,
     status: Mutable<String>,
-    stats: Mutable<String>,
+    stats: Mutable<StatsText>,
 ) -> Result<(), JsValue> {
     let window = web_sys::window().ok_or_else(|| JsValue::from_str("no window"))?;
 
@@ -456,10 +574,35 @@ fn setup(
     // Slider position + label (percent). Auto-seeds set this too, moving the
     // thumb; the slider's own input handler sets it on drag.
     let res_pct = Mutable::new(pct_of(res.get().scale));
-    // Anti-aliasing toggles (persisted; default = renderer defaults). Applied to
-    // the render worker once it's ready (see the `Ready` handler) and on toggle.
-    let msaa = Mutable::new(stored_bool(&window, MSAA_STORAGE_KEY).unwrap_or(MSAA_DEFAULT));
-    let smaa = Mutable::new(stored_bool(&window, SMAA_STORAGE_KEY).unwrap_or(SMAA_DEFAULT));
+    // Anti-aliasing toggles (persisted). Applied to the render worker once
+    // it's ready (see the `Ready` handler) and on toggle. Like the resolution
+    // seed above, a coarse-pointer device defaults BOTH off — the mobile
+    // seeds optimize purely for frame rate (a one-time notice modal below
+    // tells the user and points at Settings).
+    let coarse = coarse_pointer(&window);
+    let msaa = Mutable::new(stored_bool(&window, MSAA_STORAGE_KEY).unwrap_or(if coarse {
+        false
+    } else {
+        MSAA_DEFAULT
+    }));
+    let smaa = Mutable::new(stored_bool(&window, SMAA_STORAGE_KEY).unwrap_or(if coarse {
+        false
+    } else {
+        SMAA_DEFAULT
+    }));
+    // ── Reduced-quality notice (touch devices) ──────────────────────────────
+    // If any of the coarse-device seeds actually applied (no stored user
+    // choice overrode it), quality was visibly traded for frame rate — say so
+    // when the game first becomes visible (the `Ready` handler opens it), and
+    // point at Settings. Shown on EVERY such load — informing the user beats
+    // sparing them a dismissal; it goes quiet once they've made their own
+    // Settings choices (those persist and replace the seeds).
+    let show_quality_notice = coarse
+        && (stored_scale(&window).is_none()
+            || stored_bool(&window, MSAA_STORAGE_KEY).is_none()
+            || stored_bool(&window, SMAA_STORAGE_KEY).is_none());
+    let notice_open = Mutable::new(false);
+    dominator::append_dom(&dominator::body(), quality_notice_modal(&notice_open));
     let (w, h) = res.get().backing();
     canvas.set_width(w);
     canvas.set_height(h);
@@ -539,7 +682,7 @@ fn setup(
 
     // Handle messages coming back from the render worker.
     let on_render_msg = Closure::<dyn FnMut(MessageEvent)>::new(
-        clone!(physics, status, audio, stats_refs, res, user_pref, res_pct, msaa, smaa, render_ref, render_ready => move |e: MessageEvent| {
+        clone!(physics, status, audio, stats_refs, res, user_pref, res_pct, msaa, smaa, render_ref, render_ready, notice_open => move |e: MessageEvent| {
             match serde_wasm_bindgen::from_value::<RenderMsg>(e.data()) {
                 Ok(RenderMsg::Progress { message }) => {
                     loading_log(&message);
@@ -608,6 +751,11 @@ fn setup(
                     loading_done();
                     // The stats warm-up clock starts here (real frames exist).
                     render_ready.set(true);
+                    // The game is visible now — if this load applied the
+                    // reduced touch-device defaults, say so.
+                    if show_quality_notice {
+                        notice_open.set_neq(true);
+                    }
                     status.set("playing — roll · Space jump · click drops a ball · right-drag orbit".into());
                     // Reconcile the renderer (which built with its own defaults)
                     // to the desired AA state — only send when they differ, so a
@@ -1153,6 +1301,16 @@ const STATS_EMA_ALPHA: f64 = 0.35;
 /// measures the stall, not the framerate. Either way we re-baseline instead.
 const STATS_MIN_WINDOW_MS: f64 = 200.0;
 const STATS_MAX_WINDOW_MS: f64 = 3000.0;
+/// The sync line's "ROUGH" condition, part 1: the per-window worst display-
+/// cursor error (steps) that counts a window as rough…
+const SYNC_ROUGH_ERR: f32 = 3.0;
+/// …part 2: only while the adaptive lag is pinned at (essentially) its
+/// ceiling — below that the buffer still has headroom and will grow.
+const SYNC_ROUGH_LAG: f32 = 23.0;
+/// …part 3: consecutive rough windows before the line turns red. One spike
+/// is an event (tab switch, AA recompile); persistence is a condition.
+const SYNC_ROUGH_WINDOWS: u32 = 3;
+
 /// Frames that must present AFTER render reports `Ready` before counting
 /// starts. Boot isn't steady state — the loading overlay is fading, the
 /// startup SMAA reconcile recompiles pipelines (stalling frames right after
@@ -1182,13 +1340,21 @@ const STATS_WARMUP_FRAMES: u32 = 60;
 ///   construction) — watch it grow as balls pile up; the budget at `SIM_HZ`
 ///   240 is ~4.2 ms/step,
 /// - physics: fixed steps/s (locked to `SIM_HZ` when healthy),
+/// - sync: render/physics sync health. Normally `ok · lag N` — N (steps) is
+///   the adaptive display lag, which grows to swallow bursty pose publishing
+///   (phone thread contention). It flips to a RED `ROUGH ±E · lag N` only
+///   when the condition is genuinely bad: the per-window worst cursor error
+///   stays ≥ [`SYNC_ROUGH_ERR`] steps for [`SYNC_ROUGH_WINDOWS`] consecutive
+///   windows while the lag is pinned at its ceiling — i.e. the jitter exceeds
+///   what the buffer may absorb and motion is visibly pulsing. One-off spikes
+///   (tab switch, AA recompile) never trip it — the lag grows and it's over,
 /// - physics pool / physics main: how the solver's task CPU time split this
 ///   window between the pool workers and the physics thread help-executing in
 ///   `finishTask` — a share of measured µs, not of task counts,
 /// - balls: `BallMotions` count.
 fn install_stats(
     window: &web_sys::Window,
-    stats: Mutable<String>,
+    stats: Mutable<StatsText>,
     refs: Rc<RefCell<StatsRefs>>,
     render_ready: Rc<Cell<bool>>,
 ) -> Result<(), JsValue> {
@@ -1215,6 +1381,9 @@ fn install_stats(
     let mut steps_ema: Option<f64> = None;
     let mut frame_work_ema: Option<f64> = None;
     let mut step_work_ema: Option<f64> = None;
+    // Consecutive windows the sync condition has been rough (see the doc
+    // comment's ROUGH definition) — the line turns red at the threshold.
+    let mut rough_windows: u32 = 0;
     // The frame-tick value when `Ready` was first observed — counting starts
     // `STATS_WARMUP_FRAMES` presented frames after it.
     let mut warm_frame: Option<u32> = None;
@@ -1231,9 +1400,14 @@ fn install_stats(
                 motion.latest_step(),
                 motion.frame_work_us(),
                 motion.step_work_us(),
+                // Read-and-reset every tick (even during warm-up) so the
+                // boot spike drains before the first displayed window.
+                motion.take_sync_err(),
+                motion.display_lag(),
             )
         });
-        let (frame, step, frame_work_us, step_work_us) = motion_counts.unwrap_or((0, 0, 0, 0));
+        let (frame, step, frame_work_us, step_work_us, sync_err, lag) =
+            motion_counts.unwrap_or((0, 0, 0, 0, 0.0, 0.0));
         let task_us = match refs.pool {
             Some((addr, count)) => {
                 let pool = unsafe { &*(addr as *const TaskPool) };
@@ -1255,11 +1429,12 @@ fn install_stats(
             steps_ema = None;
             frame_work_ema = None;
             step_work_ema = None;
-            stats.set(
-                "workers\n  main          ui · audio · input\n  render        starting…\n  \
-                 physics       starting…"
+            stats.set(StatsText {
+                head: "workers\n  main          ui · audio · input\n  render        \
+                       starting…\n  physics       starting…"
                     .to_string(),
-            );
+                ..StatsText::default()
+            });
             return;
         }
         // Warm-up: don't count anything until render reported `Ready` AND
@@ -1271,11 +1446,12 @@ fn install_stats(
         }
         let base = *warm_frame.get_or_insert(frame);
         if frame.wrapping_sub(base) < STATS_WARMUP_FRAMES {
-            stats.set(
-                "workers\n  main          ui · audio · input\n  render        warming up…\n  \
-                 physics       warming up…"
+            stats.set(StatsText {
+                head: "workers\n  main          ui · audio · input\n  render        \
+                       warming up…\n  physics       warming up…"
                     .to_string(),
-            );
+                ..StatsText::default()
+            });
             return;
         }
         // No trustworthy window (first sample, or a jittered/throttled gap):
@@ -1312,15 +1488,27 @@ fn install_stats(
             None => "—".to_string(),
         };
 
-        let mut lines = String::from("workers\n  main          ui · audio · input\n");
-        lines.push_str(&format!(
-            "  render        {:.0} fps\n  frame time    {}\n  physics time  {}\n  \
-             physics       {:.0} steps/s",
+        let head = format!(
+            "workers\n  main          ui · audio · input\n  render        {:.0} fps\n  \
+             frame time    {}\n  physics time  {}\n  physics       {:.0} steps/s\n",
             *f,
             cpu(frame_work_ema, 1),
             cpu(step_work_ema, 2),
             *s,
-        ));
+        );
+        // Sync health (see the doc comment's ROUGH definition): rough = big
+        // worst-case error while the adaptive lag is already pinned at its
+        // ceiling; RED only when that persists across consecutive windows.
+        let rough_now = sync_err >= SYNC_ROUGH_ERR && lag >= SYNC_ROUGH_LAG;
+        rough_windows = if rough_now { rough_windows + 1 } else { 0 };
+        let bad = rough_windows >= SYNC_ROUGH_WINDOWS;
+        let sync = if bad {
+            format!("  sync          ROUGH ±{sync_err:.1} · lag {lag:.0}")
+        } else {
+            format!("  sync          ok · lag {lag:.0}")
+        };
+
+        let mut lines = String::new();
 
         // The solver's work split as a TRUE work share: each executor
         // accumulates the CPU µs its claimed tasks took (`task_us_counts`;
@@ -1351,7 +1539,12 @@ fn install_stats(
             lines.push_str(&format!("\n\nballs dropped  {}", balls.count()));
         }
 
-        stats.set(lines);
+        stats.set(StatsText {
+            head,
+            sync,
+            bad,
+            tail: lines,
+        });
     });
     window.set_interval_with_callback_and_timeout_and_arguments_0(
         tick.as_ref().unchecked_ref(),

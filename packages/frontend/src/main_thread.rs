@@ -97,17 +97,24 @@ fn initial_scale(window: &web_sys::Window) -> f64 {
     if let Some(stored) = stored_scale(window) {
         return stored;
     }
-    let coarse = window
-        .match_media("(pointer: coarse)")
-        .ok()
-        .flatten()
-        .map(|m| m.matches())
-        .unwrap_or(false);
-    if coarse {
+    if coarse_pointer(window) {
         COARSE_START_SCALE
     } else {
         MAX_SCALE
     }
+}
+
+/// A touch / `pointer: coarse` device (phones, tablets) — the device class
+/// that seeds lower graphics defaults: the resolution scale starts at
+/// [`COARSE_START_SCALE`] and MSAA starts off. Only DEFAULTS — a stored user
+/// choice always wins.
+fn coarse_pointer(window: &web_sys::Window) -> bool {
+    window
+        .match_media("(pointer: coarse)")
+        .ok()
+        .flatten()
+        .map(|m| m.matches())
+        .unwrap_or(false)
 }
 
 /// The persisted resolution scale, if the user has set one (clamped to range).
@@ -145,6 +152,11 @@ const SMAA_STORAGE_KEY: &str = "awsm_smaa";
 /// `localStorage` key for the stats-panel toggle (default OFF — the panel eats
 /// a lot of a phone screen, so it's opt-in via the bottom-left Stats chip).
 const STATS_STORAGE_KEY: &str = "awsm_stats";
+/// Default MSAA on a fine-pointer (desktop) device. On `pointer: coarse`
+/// devices the default is OFF instead: the same fill-rate ceiling that seeds
+/// [`COARSE_START_SCALE`] makes 4× multisampling the next-biggest GPU cost,
+/// and SMAA (cheap, still on) covers the aliasing at the reduced resolution.
+/// A stored user toggle always wins over either default.
 const MSAA_DEFAULT: bool = true;
 const SMAA_DEFAULT: bool = true;
 /// The anti-aliasing config the renderer BUILDS with (`AntiAliasing::default`):
@@ -456,9 +468,16 @@ fn setup(
     // Slider position + label (percent). Auto-seeds set this too, moving the
     // thumb; the slider's own input handler sets it on drag.
     let res_pct = Mutable::new(pct_of(res.get().scale));
-    // Anti-aliasing toggles (persisted; default = renderer defaults). Applied to
-    // the render worker once it's ready (see the `Ready` handler) and on toggle.
-    let msaa = Mutable::new(stored_bool(&window, MSAA_STORAGE_KEY).unwrap_or(MSAA_DEFAULT));
+    // Anti-aliasing toggles (persisted). Applied to the render worker once
+    // it's ready (see the `Ready` handler) and on toggle. Like the resolution
+    // seed above, a coarse-pointer device defaults MSAA OFF — same fill-rate
+    // budget, and SMAA covers the aliasing at the reduced resolution.
+    let msaa_default = if coarse_pointer(&window) {
+        false
+    } else {
+        MSAA_DEFAULT
+    };
+    let msaa = Mutable::new(stored_bool(&window, MSAA_STORAGE_KEY).unwrap_or(msaa_default));
     let smaa = Mutable::new(stored_bool(&window, SMAA_STORAGE_KEY).unwrap_or(SMAA_DEFAULT));
     let (w, h) = res.get().backing();
     canvas.set_width(w);

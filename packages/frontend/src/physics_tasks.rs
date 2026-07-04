@@ -30,7 +30,20 @@ use std::ffi::{c_char, c_void};
 
 use box3d_sys as b3;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsCast;
 use web_sys::js_sys;
+
+thread_local! {
+    /// This thread's `performance` clock (physics thread or a pool worker —
+    /// both are worker scopes), cached per thread: [`TaskPool::execute_one`]
+    /// reads it around every task, and a global lookup per task would rival
+    /// the tasks themselves. Durations only, so per-thread time origins are
+    /// irrelevant.
+    static PERF: Option<web_sys::Performance> =
+        js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("performance"))
+            .ok()
+            .and_then(|p| p.dyn_into::<web_sys::Performance>().ok());
+}
 
 /// Mirrors Box3D's `B3_MAX_TASKS` (constants.h) — the most tasks a world step
 /// can enqueue (`b3ParallelFor` runs overflow inline itself; ours does too).
@@ -68,6 +81,10 @@ pub struct TaskPool {
     /// Per-executor claim counts: index 0 = the physics thread (helping in
     /// `finishTask`), 1.. = pool workers. Proof-of-parallelism telemetry.
     claims: [AtomicU32; MAX_WORKERS],
+    /// Per-executor accumulated task CPU time in µs (wrapping; same indexing
+    /// as `claims`). The TRUE work-share telemetry: claim counts weight a
+    /// 5 µs task the same as a 500 µs one — these don't.
+    task_us: [AtomicU32; MAX_WORKERS],
     tasks: [TaskSlot; MAX_TASKS],
 }
 
@@ -100,6 +117,7 @@ impl TaskPool {
             next_slot: AtomicU32::new(0),
             sem: AtomicU32::new(0),
             claims: [ZERO; MAX_WORKERS],
+            task_us: [ZERO; MAX_WORKERS],
             tasks: [SLOT; MAX_TASKS],
         }))
     }
@@ -126,6 +144,15 @@ impl TaskPool {
             .collect()
     }
 
+    /// Snapshot of the accumulated per-executor task CPU time (µs, wrapping;
+    /// first `n` executors) — diff two snapshots for a window's work share.
+    pub fn task_us_counts(&self, n: usize) -> Vec<u32> {
+        self.task_us[..n.min(MAX_WORKERS)]
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .collect()
+    }
+
     /// Claim and run one pending task. `who` indexes the claim counters.
     /// Returns false when nothing was pending.
     fn execute_one(&self, who: usize) -> bool {
@@ -141,6 +168,10 @@ impl TaskPool {
             {
                 continue;
             }
+            // Time the task with this thread's cached clock — the µs feed the
+            // stats panel's work share (claim counts alone over-weight tiny
+            // tasks).
+            let t0 = PERF.with(|p| p.as_ref().map(|perf| perf.now()));
             unsafe {
                 let cb: b3::b3TaskCallback =
                     core::mem::transmute(slot.callback.load(Ordering::Relaxed));
@@ -149,7 +180,12 @@ impl TaskPool {
             slot.status.store(COMPLETE, Ordering::Release);
             // Wake any finishTask waiter parked on this slot.
             futex_notify(&slot.status, u32::MAX);
-            self.claims[who.min(MAX_WORKERS - 1)].fetch_add(1, Ordering::Relaxed);
+            let who = who.min(MAX_WORKERS - 1);
+            self.claims[who].fetch_add(1, Ordering::Relaxed);
+            if let Some(t0) = t0 {
+                let elapsed = PERF.with(|p| p.as_ref().map(|perf| perf.now()).unwrap_or(t0)) - t0;
+                self.task_us[who].fetch_add((elapsed * 1000.0).max(0.0) as u32, Ordering::Relaxed);
+            }
             return true;
         }
         false

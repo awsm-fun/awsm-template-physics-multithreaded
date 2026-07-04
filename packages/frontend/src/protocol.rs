@@ -336,6 +336,18 @@ pub struct BodyMotion {
     /// Bumped by render once per presented frame; physics blocks on it to pace
     /// the sim to vsync (see the type docs).
     frame_tick: AtomicU32,
+    /// Accumulated render-thread CPU time, in MICROSECONDS (wrapping): how long
+    /// each frame's work — interpolation, transform update, encode + submit —
+    /// took on the render thread, summed across frames. The stats panel divides
+    /// its delta by the `frame_tick` delta for avg ms/frame: a real workload
+    /// metric, unlike fps, which is vsync-capped and monitor-dependent. GPU
+    /// time is NOT included (the submit returns before the GPU finishes).
+    frame_work_us: AtomicU32,
+    /// Accumulated physics-thread CPU time, in MICROSECONDS (wrapping): the
+    /// full cost of each fixed step — input poll, `b3World_Step`, contact/hit
+    /// classification, pose publish — summed across steps. The stats panel
+    /// divides its delta by the step-count delta for avg ms/step.
+    step_work_us: AtomicU32,
 }
 
 impl BodyMotion {
@@ -344,7 +356,31 @@ impl BodyMotion {
         BodyMotion {
             ring: PoseRing::new(pos, quat),
             frame_tick: AtomicU32::new(0),
+            frame_work_us: AtomicU32::new(0),
+            step_work_us: AtomicU32::new(0),
         }
+    }
+
+    /// Render side: add one frame's CPU work time (µs) to the running total.
+    pub fn add_frame_work_us(&self, us: u32) {
+        self.frame_work_us.fetch_add(us, Ordering::Relaxed);
+    }
+
+    /// Accumulated render-thread work time (µs, wrapping) — diff two reads and
+    /// divide by the `frame_tick` delta for avg time per frame.
+    pub fn frame_work_us(&self) -> u32 {
+        self.frame_work_us.load(Ordering::Relaxed)
+    }
+
+    /// Physics side: add one fixed step's CPU work time (µs) to the total.
+    pub fn add_step_work_us(&self, us: u32) {
+        self.step_work_us.fetch_add(us, Ordering::Relaxed);
+    }
+
+    /// Accumulated physics-thread work time (µs, wrapping) — diff two reads
+    /// and divide by the step-count delta for avg time per step.
+    pub fn step_work_us(&self) -> u32 {
+        self.step_work_us.load(Ordering::Relaxed)
     }
 
     /// Render side: signal that a frame was presented, waking the physics thread
@@ -443,6 +479,16 @@ pub struct InputState {
     /// rotates the held-key roll direction by this so W/A/S/D stay
     /// camera-relative at any orbit angle.
     camera_yaw: AtomicU32,
+    /// Touch fling: bumped once per swipe gesture (edge-detected like
+    /// `jump_seq`). The velocity is valid at the seq bump — values are stored
+    /// first, then the seq (Release), pairing with the Acquire in
+    /// [`poll_fling`](Self::poll_fling).
+    fling_seq: AtomicU32,
+    /// Swipe release velocity (m/s, `f32::to_bits`) in the CAMERA frame —
+    /// x right, −z away from the camera, the same convention as the held-key
+    /// direction. Physics rotates it by `camera_yaw` exactly like W/A/S/D.
+    fling_x: AtomicU32,
+    fling_z: AtomicU32,
 }
 
 impl Default for InputState {
@@ -457,6 +503,9 @@ impl InputState {
             held: AtomicU32::new(0),
             jump_seq: AtomicU32::new(0),
             camera_yaw: AtomicU32::new(0), // 0u32 == 0.0f32.to_bits()
+            fling_seq: AtomicU32::new(0),
+            fling_x: AtomicU32::new(0),
+            fling_z: AtomicU32::new(0),
         }
     }
 
@@ -482,6 +531,37 @@ impl InputState {
     /// Physics side: the jump counter (diff against your last-seen to edge-detect).
     pub fn jump_seq(&self) -> u32 {
         self.jump_seq.load(Ordering::Relaxed)
+    }
+
+    /// Main side: publish a touch-swipe fling with the given CAMERA-frame
+    /// velocity (m/s — x right, −z away from the camera). Values first, then
+    /// the seq bump (Release), so [`poll_fling`](Self::poll_fling) never reads
+    /// a stale pair.
+    pub fn bump_fling(&self, vx: f32, vz: f32) {
+        self.fling_x.store(vx.to_bits(), Ordering::Relaxed);
+        self.fling_z.store(vz.to_bits(), Ordering::Relaxed);
+        self.fling_seq.fetch_add(1, Ordering::Release);
+    }
+
+    /// Physics side: consume a pending fling. Returns the camera-frame swipe
+    /// velocity when `last_seq` is behind (and advances it to current). Like
+    /// [`BallMotions::poll_drop`], if two swipes land inside one poll window
+    /// the later one wins — fine at gesture cadence.
+    pub fn poll_fling(&self, last_seq: &mut u32) -> Option<(f32, f32)> {
+        let seq = self.fling_seq.load(Ordering::Acquire);
+        if seq == *last_seq {
+            return None;
+        }
+        *last_seq = seq;
+        Some((
+            f32::from_bits(self.fling_x.load(Ordering::Relaxed)),
+            f32::from_bits(self.fling_z.load(Ordering::Relaxed)),
+        ))
+    }
+
+    /// Physics side: the fling counter's current value (seed your last-seen).
+    pub fn fling_seq(&self) -> u32 {
+        self.fling_seq.load(Ordering::Relaxed)
     }
 
     /// Main side: publish the camera yaw (radians) after an orbit drag.

@@ -171,13 +171,16 @@ impl Default for BallMotions {
     }
 }
 
-/// Pose-ring depth, in steps (~67 ms of history at 240 Hz). The ring is a
+/// Pose-ring depth, in steps (~133 ms of history at 240 Hz). The ring is a
 /// **jitter buffer**: the render thread samples it at its own display time, so
 /// any wobble or burstiness in when physics wakes and publishes — up to this
 /// many steps — is absorbed by *data*, not clamped by an interpolation window.
-/// (Measured wobble on a loaded machine is ±1–2 steps; the depth is generous
-/// so only genuine hiccups — tab hidden, physics stall — fall off the end.)
-pub const POSE_RING: usize = 16;
+/// Measured wobble is ±1–2 steps on a loaded desktop but 6–12 steps on
+/// phones (thread contention delays the physics wake, then the accumulator
+/// catches up in a burst), and the render thread's display lag adapts to
+/// that envelope — so the ring must hold the worst adaptive lag plus margin;
+/// only genuine hiccups (tab hidden, physics stall) fall off the end.
+pub const POSE_RING: usize = 32;
 
 /// One fixed step's published pose, seqlock'd, tagged with its absolute step
 /// index so a reader can tell whether the slot still holds the step it wants
@@ -356,6 +359,11 @@ pub struct BodyMotion {
     /// (`TARGET_LAG` steps) mean the interpolation is ramming its rails and
     /// motion visibly pulses.
     sync_err_bits: AtomicU32,
+    /// The render thread's CURRENT adaptive display lag (steps, `f32` bits) —
+    /// how far the display cursor trails the newest published pose. Grows to
+    /// absorb observed publish burstiness (see the render thread's cursor);
+    /// published here for the stats panel's sync line.
+    display_lag_bits: AtomicU32,
 }
 
 impl BodyMotion {
@@ -367,6 +375,7 @@ impl BodyMotion {
             frame_work_us: AtomicU32::new(0),
             step_work_us: AtomicU32::new(0),
             sync_err_bits: AtomicU32::new(0),
+            display_lag_bits: AtomicU32::new(0),
         }
     }
 
@@ -380,6 +389,17 @@ impl BodyMotion {
     /// resets the running max to zero.
     pub fn take_sync_err(&self) -> f32 {
         f32::from_bits(self.sync_err_bits.swap(0, Ordering::Relaxed))
+    }
+
+    /// Render side: publish the current adaptive display lag (steps).
+    pub fn set_display_lag(&self, lag: f32) {
+        self.display_lag_bits
+            .store(lag.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Stats side: the render thread's current adaptive display lag (steps).
+    pub fn display_lag(&self) -> f32 {
+        f32::from_bits(self.display_lag_bits.load(Ordering::Relaxed))
     }
 
     /// Render side: add one frame's CPU work time (µs) to the running total.

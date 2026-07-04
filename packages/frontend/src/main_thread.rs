@@ -217,8 +217,41 @@ struct StatsSample {
     task_us: Vec<u32>,
 }
 
+/// `?reset` in the URL wipes every persisted app setting (resolution, MSAA,
+/// SMAA, stats toggle) so the load boots with fresh defaults — the escape
+/// hatch when a device carries choices from old sessions (which override the
+/// device-class seeds and suppress the reduced-quality notice) and the
+/// browser's site-data UI won't surface them. Must run before ANY stored
+/// value is read, i.e. first thing in [`start`].
+fn maybe_reset_settings(window: &web_sys::Window) {
+    let has_reset = window
+        .location()
+        .search()
+        .ok()
+        .and_then(|s| web_sys::UrlSearchParams::new_with_str(&s).ok())
+        .map(|p| p.get("reset").is_some())
+        .unwrap_or(false);
+    if !has_reset {
+        return;
+    }
+    if let Ok(Some(ls)) = window.local_storage() {
+        for key in [
+            RES_STORAGE_KEY,
+            MSAA_STORAGE_KEY,
+            SMAA_STORAGE_KEY,
+            STATS_STORAGE_KEY,
+        ] {
+            let _ = ls.remove_item(key);
+        }
+    }
+    loading_log("?reset — stored settings cleared, booting with defaults");
+}
+
 /// Build + mount the DOM, then start the worker pipeline.
 pub fn start() -> Result<(), JsValue> {
+    if let Some(window) = web_sys::window() {
+        maybe_reset_settings(&window);
+    }
     let status = Mutable::new("booting…".to_string());
     let stats = Mutable::new(String::new());
     let about_open = Mutable::new(false);
@@ -1278,11 +1311,11 @@ const STATS_WARMUP_FRAMES: u32 = 60;
 ///   construction) — watch it grow as balls pile up; the budget at `SIM_HZ`
 ///   240 is ~4.2 ms/step,
 /// - physics: fixed steps/s (locked to `SIM_HZ` when healthy),
-/// - sync: the window's max |display-cursor error| in steps — the
-///   render/physics sync health. The interpolation cursor budgets
-///   `TARGET_LAG` (2) steps of wobble; sustained readings beyond that mean
-///   pose publishing is bursty (thread contention) and motion visibly
-///   pulses,
+/// - sync: the window's max |display-cursor error| plus the current adaptive
+///   display lag, both in steps — the render/physics sync health. The lag
+///   grows to swallow bursty pose publishing (phone thread contention), so
+///   err should stay small everywhere; err repeatedly outrunning the lag
+///   means motion is visibly pulsing,
 /// - physics pool / physics main: how the solver's task CPU time split this
 ///   window between the pool workers and the physics thread help-executing in
 ///   `finishTask` — a share of measured µs, not of task counts,
@@ -1335,10 +1368,11 @@ fn install_stats(
                 // Read-and-reset every tick (even during warm-up) so the
                 // boot spike drains before the first displayed window.
                 motion.take_sync_err(),
+                motion.display_lag(),
             )
         });
-        let (frame, step, frame_work_us, step_work_us, sync_err) =
-            motion_counts.unwrap_or((0, 0, 0, 0, 0.0));
+        let (frame, step, frame_work_us, step_work_us, sync_err, lag) =
+            motion_counts.unwrap_or((0, 0, 0, 0, 0.0, 0.0));
         let task_us = match refs.pool {
             Some((addr, count)) => {
                 let pool = unsafe { &*(addr as *const TaskPool) };
@@ -1420,12 +1454,13 @@ fn install_stats(
         let mut lines = String::from("workers\n  main          ui · audio · input\n");
         lines.push_str(&format!(
             "  render        {:.0} fps\n  frame time    {}\n  physics time  {}\n  \
-             physics       {:.0} steps/s\n  sync          ±{:.1} steps",
+             physics       {:.0} steps/s\n  sync          ±{:.1} · lag {:.0} steps",
             *f,
             cpu(frame_work_ema, 1),
             cpu(step_work_ema, 2),
             *s,
             sync_err,
+            lag,
         ));
 
         // The solver's work split as a TRUE work share: each executor

@@ -448,19 +448,31 @@ async fn run(
     const FIXED_DT: f32 = (1.0 / SIM_HZ) as f32;
     // ── Display cursor: WHICH sim time this frame shows, in steps ───────────
     // The cursor advances on the render clock and trails the newest published
-    // step by TARGET_LAG steps; poses come from the shared pose ring at
+    // step by an ADAPTIVE lag; poses come from the shared pose ring at
     // cursor⌊⌋/cursor⌈⌉ (see `PoseRing`). This is a jitter buffer: physics
     // wake wobble/bursts don't move the cursor, they only wiggle how far
     // behind `latest` it trails — the sampled motion stays uniform as long as
-    // the wobble fits inside the lag. TARGET_LAG must exceed the wobble
-    // amplitude (measured ±1–2 steps on a loaded machine); it is the display
-    // latency price, in steps (2 steps = 8.3 ms at 240 Hz — SIM_HZ is the
-    // knob that keeps it small). REANCHOR_GAIN only sets how fast residual
-    // clock drift re-centers (~0.3 s time constant); correctness does not
-    // depend on it.
-    const TARGET_LAG: f64 = 2.0;
+    // the wobble fits inside the lag. The lag is the display-latency price
+    // (in steps: 2 = 8.3 ms at 240 Hz), so it FOLLOWS the observed wobble
+    // envelope instead of being fixed: a desktop's ±1–2-step wobble keeps it
+    // at the minimum, while a phone — where thread contention delays the
+    // physics wake and the accumulator then catches up in a 6–12-step burst —
+    // floats up until the bursts fit (the alternative is the cursor ramming
+    // its rails: motion visibly pulses, like the ball is re-pushed). The
+    // envelope is a decaying peak, so a rough patch stops costing latency
+    // once it passes. REANCHOR_GAIN only sets how fast residual clock drift
+    // re-centers (~0.3 s time constant); correctness does not depend on it.
+    /// Lag floor — routine desktop wobble fits inside this.
+    const TARGET_LAG_MIN: f64 = 2.0;
+    /// Lag ceiling (100 ms at 240 Hz) — must stay well inside [`POSE_RING`],
+    /// and past this smoothness stops being worth the added latency.
+    const TARGET_LAG_MAX: f64 = 24.0;
+    /// Per-frame decay of the wobble peak (halves in ~5 s at 60 fps).
+    const WOBBLE_DECAY: f64 = 0.9977;
     const REANCHOR_GAIN: f64 = 0.05;
     let mut display_step: f64 = 0.0;
+    let mut target_lag: f64 = TARGET_LAG_MIN;
+    let mut wobble: f64 = 0.0;
     let mut last_step: u32 = 0;
     // The previous frame's VSYNC timestamp (the rAF argument) — `None` until
     // the first frame. See `RafCell`: frame time must come from the vsync
@@ -557,7 +569,15 @@ async fn run(
         let steps_this_frame = latest.wrapping_sub(last_step);
         last_step = latest;
         display_step += (dt / FIXED_DT) as f64;
-        let err = (latest as f64 - TARGET_LAG) - display_step;
+        let err = (latest as f64 - target_lag) - display_step;
+        // Adapt the lag to the observed wobble envelope (see the cursor's
+        // declaration comment). Errors beyond the ring are discontinuities
+        // (tab hidden, physics stall) — the hard clamp below handles those;
+        // they are not jitter and must not inflate the lag.
+        if err.abs() < POSE_RING as f64 {
+            wobble = (wobble * WOBBLE_DECAY).max(err.abs());
+            target_lag = (TARGET_LAG_MIN + wobble).clamp(TARGET_LAG_MIN, TARGET_LAG_MAX);
+        }
         err_ema += (err - err_ema) * 0.1;
         display_step += err_ema * REANCHOR_GAIN;
         display_step = display_step.clamp(
@@ -565,8 +585,9 @@ async fn run(
             latest as f64,
         );
         sync_stats.record(steps_this_frame, err as f32);
-        // Publish the |error| for the stats panel's sync-health line.
+        // Publish sync health + the current lag for the stats panel.
         motion.note_sync_err(err.abs() as f32);
+        motion.set_display_lag(target_lag as f32);
 
         let (pos, rot) = sample_ring(motion.ring(), display_step);
         // Bake the ball mesh's authored scale in (the arena slot is the absolute

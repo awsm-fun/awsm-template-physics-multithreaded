@@ -224,9 +224,13 @@ pub fn start() -> Result<(), JsValue> {
     let about_open = Mutable::new(false);
     // Stats panel visibility: OFF by default (it eats a lot of a phone
     // screen); the bottom-left Stats chip toggles it and the choice persists.
+    // Never auto-open on a coarse device, even if a stored "open" flag says
+    // to — the panel eats a phone screen (the whole reason it's opt-in). The
+    // chip still toggles it within the session; the persisted choice only
+    // restores on fine-pointer (desktop) devices.
     let stats_open = Mutable::new(
         web_sys::window()
-            .and_then(|w| stored_bool(&w, STATS_STORAGE_KEY))
+            .map(|w| !coarse_pointer(&w) && stored_bool(&w, STATS_STORAGE_KEY).unwrap_or(false))
             .unwrap_or(false),
     );
     loading_log("wasm compiled — main thread booting");

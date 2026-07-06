@@ -105,3 +105,10 @@ codegen-units = 1
 # Remove this once a fixed dominator is published to crates.io.
 [patch.crates-io]
 dominator = { git = "https://github.com/Pauan/rust-dominator", rev = "25597cd" }
+
+# TEMPORARY (verification): local renderer with the deferred/pooled pipeline
+# compiles (lazy-pipeline-compiles branch). Remove once 0.18.1 is published.
+awsm-renderer = { path = "../../renderer/packages/crates/renderer" }
+awsm-renderer-core = { path = "../../renderer/packages/crates/renderer-core" }
+awsm-renderer-scene = { path = "../../renderer/packages/crates/scene" }
+awsm-renderer-scene-loader = { path = "../../renderer/packages/crates/scene-loader" }

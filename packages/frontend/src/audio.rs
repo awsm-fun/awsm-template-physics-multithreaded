@@ -142,15 +142,17 @@ impl AudioController {
 
         // ── Fetch EVERY worklet wasm the export ships (roll + clack today —
         // each worklet node references its module by id, so all of them must
-        // be compiled + stored before any voice that uses one is built) ─────
+        // be compiled + stored before any voice that uses one is built).
+        // Fetched CONCURRENTLY — they're independent files, so there's no
+        // reason to pay a network round trip per module in series. ──────────
         if lib.assets.wasm_modules.is_empty() {
             return Err(JsValue::from_str("audio: no wasm worklet in export"));
         }
-        let mut modules = Vec::with_capacity(lib.assets.wasm_modules.len());
-        for wasm in &lib.assets.wasm_modules {
+        let modules = futures::future::try_join_all(lib.assets.wasm_modules.iter().map(|wasm| {
             let wasm_url = format!("{base}/audio/assets/{}.wasm", wasm.id);
-            modules.push((wasm.id, http_bytes(&wasm_url).await?));
-        }
+            async move { Ok::<_, JsValue>((wasm.id, http_bytes(&wasm_url).await?)) }
+        }))
+        .await?;
 
         // ── One player for everything (shared context + master bus) ─────────
         let mut player = build_player(&modules).await?;

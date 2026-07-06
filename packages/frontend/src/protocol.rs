@@ -720,6 +720,18 @@ pub enum RenderMsg {
         is_fallback: bool,
         max_texture_dim: u32,
     },
+    /// The render worker began recompiling the AA-dependent pipelines for a
+    /// Settings anti-aliasing change. Main shows the blocking "compiling
+    /// pipelines" modal until [`RenderMsg::AaCompileDone`]. Only the *first*
+    /// switch in each direction actually compiles — the renderer caches
+    /// variants — so later toggles flash the modal for a frame at most.
+    AaCompileStart { msaa: bool, smaa: bool },
+    /// A progress line for the in-flight AA recompile (mirrors the gpu-commit
+    /// callback), shown inside the modal.
+    AaCompileProgress { message: String },
+    /// The AA recompile finished — success or failure (failure also posts
+    /// [`RenderMsg::Error`]); main hides the modal either way.
+    AaCompileDone,
     /// Something failed in the render worker.
     Error { message: String },
 }

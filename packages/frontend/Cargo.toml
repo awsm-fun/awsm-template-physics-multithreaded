@@ -34,6 +34,7 @@ toml.workspace = true
 
 # ── DOM, driven from pure Rust ───────────────────────────────────────────────
 dominator.workspace = true
+futures.workspace = true
 futures-signals.workspace = true
 
 # ── glue ─────────────────────────────────────────────────────────────────────

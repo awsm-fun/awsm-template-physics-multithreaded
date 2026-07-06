@@ -175,6 +175,19 @@ pub fn start(payload: JsValue) -> Result<(), JsValue> {
         .ok()
         .and_then(|v| v.as_string())
         .unwrap_or_default();
+    // The desired STARTUP anti-aliasing (main's stored Settings prefs) rides
+    // the spawn payload so the renderer BUILDS with it — compiling exactly the
+    // variants this session needs. (Previously the renderer built at its own
+    // default and main posted a reconcile after `Ready`, which recompiled the
+    // whole pipeline set right as the game became playable — a long stall on
+    // every load for any device whose prefs differ, i.e. every touch device.)
+    let get_bool = |key: &str| {
+        js_sys::Reflect::get(&payload, &JsValue::from_str(key))
+            .ok()
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    };
+    let desired_aa = (get_bool("msaa"), get_bool("smaa"));
     let canvas_handle = canvas.clone();
     post_progress("render worker: requesting WebGPU device…");
     let gpu =
@@ -183,7 +196,7 @@ pub fn start(payload: JsValue) -> Result<(), JsValue> {
         .with_device_request_limits(DeviceRequestLimits::max_all());
 
     wasm_bindgen_futures::spawn_local(async move {
-        if let Err(err) = run(gpu_builder, canvas_handle, origin).await {
+        if let Err(err) = run(gpu_builder, canvas_handle, origin, desired_aa).await {
             tracing::error!("render thread: {err:?}");
             post_to_main(&RenderMsg::Error {
                 message: format!("{err:?}"),
@@ -197,6 +210,7 @@ async fn run(
     gpu_builder: awsm_renderer_core::renderer::AwsmRendererWebGpuBuilder,
     canvas: web_sys::OffscreenCanvas,
     origin: String,
+    desired_aa: (bool, bool),
 ) -> Result<(), JsValue> {
     use awsm_renderer::camera::CameraMatrices;
     use awsm_renderer::AwsmRendererBuilder;
@@ -209,10 +223,14 @@ async fn run(
     report_gpu_info().await;
 
     let mut renderer = AwsmRendererBuilder::new(gpu_builder)
+        .with_anti_aliasing(aa_config(desired_aa))
         .build()
         .await
         .map_err(|e| JsValue::from_str(&format!("build renderer: {e}")))?;
-    post_progress("render worker: WebGPU device + renderer ready");
+    post_progress(&format!(
+        "render worker: WebGPU device + renderer ready (msaa {}, smaa {})",
+        desired_aa.0, desired_aa.1
+    ));
 
     // Shared mode must be enabled BEFORE the load so every scene node gets an
     // arena slot — the sphere's slot is then foreign-writable by physics.
@@ -516,25 +534,50 @@ async fn run(
             let cell = cell_loop.clone();
             let done = reconfiguring.clone();
             wasm_bindgen_futures::spawn_local(async move {
-                let aa = awsm_renderer::anti_alias::AntiAliasing {
-                    msaa_sample_count: if msaa { Some(4) } else { None },
-                    smaa,
-                    mipmap: true,
-                };
                 // Own the renderer across the awaits (borrow released here).
                 let Some(mut renderer) = cell.borrow_mut().take() else {
                     done.set(false);
                     return;
                 };
-                if let Err(e) = renderer.set_anti_aliasing(aa).await {
+                // Tell main first — it raises the "compiling pipelines" modal
+                // for the whole recompile (the first switch in each direction
+                // really compiles; later ones hit the variant cache and the
+                // modal only flashes).
+                post_to_main(&RenderMsg::AaCompileStart { msaa, smaa });
+                if let Err(e) = renderer.set_anti_aliasing(aa_config((msaa, smaa))).await {
                     tracing::error!("render thread: set_anti_aliasing failed: {e:?}");
-                } else if let Err(e) = renderer.commit_load(|_| {}).await {
-                    tracing::error!("render thread: commit_load after AA change failed: {e:?}");
+                    post_to_main(&RenderMsg::Error {
+                        message: format!("anti-aliasing change: {e:?}"),
+                    });
                 } else {
-                    tracing::info!(
-                        "render thread: anti-aliasing applied (msaa {msaa}, smaa {smaa})"
-                    );
+                    // The actual pipeline compiles happen in commit_load —
+                    // stream its progress into the modal via the renderer's
+                    // shared phase label, deduped (the callback fires per
+                    // resolution).
+                    let mut last_line = String::new();
+                    let progress = |s: awsm_renderer::loading::LoadingStats| {
+                        let Some(line) = s.phase_label() else { return };
+                        if line != last_line {
+                            post_to_main(&RenderMsg::AaCompileProgress {
+                                message: line.clone(),
+                            });
+                            last_line = line;
+                        }
+                    };
+                    if let Err(e) = renderer.commit_load(progress).await {
+                        tracing::error!("render thread: commit_load after AA change failed: {e:?}");
+                        post_to_main(&RenderMsg::Error {
+                            message: format!("anti-aliasing pipelines: {e:?}"),
+                        });
+                    } else {
+                        tracing::info!(
+                            "render thread: anti-aliasing applied (msaa {msaa}, smaa {smaa})"
+                        );
+                    }
                 }
+                // Always lower the modal — even on failure (the error line is
+                // already on its way to the status bar).
+                post_to_main(&RenderMsg::AaCompileDone);
                 *cell.borrow_mut() = Some(renderer);
                 done.set(false);
             });
@@ -973,6 +1016,19 @@ fn install_render_input(
     scope.set_onmessage(Some(cb.as_ref().unchecked_ref()));
     cb.forget();
     Ok(())
+}
+
+/// Map the Settings `(msaa, smaa)` toggle pair onto the renderer's config:
+/// MSAA is 4× or off (the only counts it supports), mipmapping always on.
+/// Used both at BUILD time (the startup prefs, so boot compiles exactly the
+/// variants this session needs — no post-`Ready` reconcile recompile) and for
+/// runtime Settings changes.
+fn aa_config((msaa, smaa): (bool, bool)) -> awsm_renderer::anti_alias::AntiAliasing {
+    awsm_renderer::anti_alias::AntiAliasing {
+        msaa_sample_count: if msaa { Some(4) } else { None },
+        smaa,
+        mipmap: true,
+    }
 }
 
 /// Probe the WebGPU adapter for the two facts main needs to size the canvas —

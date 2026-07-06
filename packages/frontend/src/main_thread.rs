@@ -160,12 +160,6 @@ const STATS_STORAGE_KEY: &str = "awsm_stats";
 /// user toggle always wins over either default.
 const MSAA_DEFAULT: bool = true;
 const SMAA_DEFAULT: bool = true;
-/// The anti-aliasing config the renderer BUILDS with (`AntiAliasing::default`):
-/// MSAA 4× on, SMAA off. The on-`Ready` reconcile compares the desired state
-/// against THIS (not the app defaults above) to decide whether a startup
-/// recompile is needed — so defaulting SMAA on actually enables it at boot.
-const RENDERER_BUILD_MSAA: bool = true;
-const RENDERER_BUILD_SMAA: bool = false;
 
 /// Read a persisted boolean setting (`"1"`/`"0"`), `None` if unset.
 fn stored_bool(window: &web_sys::Window, key: &str) -> Option<bool> {
@@ -379,6 +373,35 @@ fn quality_notice_modal(open: &Mutable<bool>) -> dominator::Dom {
                 .class("notice-ok")
                 .text("OK")
                 .event(clone!(open => move |_: dominator::events::Click| open.set_neq(false)))
+            }))
+        }))
+    })
+}
+
+/// The blocking "compiling pipelines" overlay, raised while the render worker
+/// recompiles for a Settings anti-aliasing change
+/// ([`RenderMsg::AaCompileStart`] → [`RenderMsg::AaCompileDone`]). Not
+/// user-dismissable — it lowers itself when the worker reports done. `None` =
+/// hidden; `Some(line)` = shown, with the worker's live progress line.
+fn aa_compile_modal(state: &Mutable<Option<String>>) -> dominator::Dom {
+    html!("div", {
+        .class("settings-overlay")
+        // Above the Settings modal that triggered it (both are z-index 20).
+        .style("z-index", "30")
+        .visible_signal(state.signal_cloned().map(|s| s.is_some()))
+        .child(html!("div", {
+            .class("settings-modal")
+            .child(html!("h2", { .text("Compiling Pipelines") }))
+            .child(html!("p", {
+                .class("notice-text")
+                .text("Rebuilding the render pipelines for the new \
+                       anti-aliasing settings. The first switch in each \
+                       direction compiles shaders; after that it's cached and \
+                       instant.")
+            }))
+            .child(html!("p", {
+                .class("settings-hint")
+                .text_signal(state.signal_cloned().map(|s| s.unwrap_or_default()))
             }))
         }))
     })
@@ -603,6 +626,10 @@ fn setup(
             || stored_bool(&window, SMAA_STORAGE_KEY).is_none());
     let notice_open = Mutable::new(false);
     dominator::append_dom(&dominator::body(), quality_notice_modal(&notice_open));
+    // The "compiling pipelines" overlay for runtime AA changes (render-worker-
+    // driven via `RenderMsg::AaCompile*`).
+    let aa_compile: Mutable<Option<String>> = Mutable::new(None);
+    dominator::append_dom(&dominator::body(), aa_compile_modal(&aa_compile));
     let (w, h) = res.get().backing();
     canvas.set_width(w);
     canvas.set_height(h);
@@ -647,6 +674,10 @@ fn setup(
     let payload = js_sys::Object::new();
     set(&payload, "canvas", &offscreen);
     set(&payload, "origin", &JsValue::from_str(&base));
+    // The desired startup anti-aliasing rides the spawn payload so the render
+    // worker BUILDS at it (no post-`Ready` reconcile recompile).
+    set(&payload, "msaa", &JsValue::from_bool(msaa.get()));
+    set(&payload, "smaa", &JsValue::from_bool(smaa.get()));
     let transfer = js_sys::Array::new();
     transfer.push(&offscreen);
 
@@ -682,7 +713,7 @@ fn setup(
 
     // Handle messages coming back from the render worker.
     let on_render_msg = Closure::<dyn FnMut(MessageEvent)>::new(
-        clone!(physics, status, audio, stats_refs, res, user_pref, res_pct, msaa, smaa, render_ref, render_ready, notice_open => move |e: MessageEvent| {
+        clone!(physics, status, audio, stats_refs, res, user_pref, res_pct, render_ref, render_ready, notice_open, aa_compile => move |e: MessageEvent| {
             match serde_wasm_bindgen::from_value::<RenderMsg>(e.data()) {
                 Ok(RenderMsg::Progress { message }) => {
                     loading_log(&message);
@@ -757,15 +788,9 @@ fn setup(
                         notice_open.set_neq(true);
                     }
                     status.set("playing — roll · Space jump · click drops a ball · right-drag orbit".into());
-                    // Reconcile the renderer (which built with its own defaults)
-                    // to the desired AA state — only send when they differ, so a
-                    // matching config skips a needless startup recompile.
-                    let (m, s) = (msaa.get(), smaa.get());
-                    if (m, s) != (RENDERER_BUILD_MSAA, RENDERER_BUILD_SMAA) {
-                        if let Some(r) = render_ref.borrow().as_ref() {
-                            post_quality(r, m, s);
-                        }
-                    }
+                    // No AA reconcile here: the render worker BUILT at the
+                    // desired config (it rode the spawn payload), so the old
+                    // post-`Ready` full-pipeline recompile is gone.
                 }
                 Ok(RenderMsg::GpuInfo { is_fallback, max_texture_dim }) => {
                     let mut st = res.get();
@@ -786,6 +811,17 @@ fn setup(
                         post_resize(r, &st);
                     }
                 }
+                Ok(RenderMsg::AaCompileStart { msaa, smaa }) => {
+                    aa_compile.set(Some(format!(
+                        "MSAA 4× {} · SMAA {}",
+                        if msaa { "on" } else { "off" },
+                        if smaa { "on" } else { "off" }
+                    )));
+                }
+                Ok(RenderMsg::AaCompileProgress { message }) => {
+                    aa_compile.set(Some(message));
+                }
+                Ok(RenderMsg::AaCompileDone) => aa_compile.set(None),
                 Ok(RenderMsg::Error { message }) => {
                     loading_log(&format!("ERROR: {message}"));
                     status.set(format!("render error: {message}"));

@@ -222,8 +222,21 @@ async fn run(
     // request: cheap, and decoupled from the renderer's own device build below.
     report_gpu_info().await;
 
+    // The builder reports its coarse boot phases through this handler — wire
+    // them to the loading screen. Since the deferred-boot renderer, `build()`
+    // compiles no pipelines (they're reserved and compiled by the labeled
+    // `ensure_config_pipelines` step below), so only `Init` — device +
+    // core GPU resources — takes visible time here.
     let mut renderer = AwsmRendererBuilder::new(gpu_builder)
         .with_anti_aliasing(aa_config(desired_aa))
+        .with_phase_handler(|phase| {
+            use awsm_renderer::RendererLoadingPhase as P;
+            let message = match phase {
+                P::Init => "renderer init: GPU device + core resources…",
+                P::CompilingShaders | P::BuildingPipelines | P::Ready => return,
+            };
+            post_progress(message);
+        })
         .build()
         .await
         .map_err(|e| JsValue::from_str(&format!("build renderer: {e}")))?;
@@ -236,18 +249,31 @@ async fn run(
     // arena slot — the sphere's slot is then foreign-writable by physics.
     renderer.transforms.enable_shared_arena();
 
-    // ── Load the exported scene via the PLAYER path ─────────────────────────
+    // ── Warm-up + scene fetch, CONCURRENTLY ─────────────────────────────────
+    // `build()` compiled NO pipeline — it only reserved them. We know our config
+    // here (AA rode the spawn payload), so we warm exactly that set now via
+    // `ensure_config_pipelines` (only what's needed — not an eager compile of
+    // everything). That warm-up is GPU/driver work; the `scene.toml` fetch is
+    // network work; the two share no data, so we run them under one `join!` and
+    // let the single-threaded executor interleave them — the compile hides the
+    // fetch latency instead of following it. First visit really compiles (the
+    // browser caches from then on); warm visits are a no-op.
     let bundle_base = format!("{}/bundle", origin.trim_end_matches('/'));
     let scene_url = format!("{bundle_base}/scene.toml");
-    post_progress("fetching scene.toml…");
-    let scene = fetch_scene(&scene_url)
-        .await
-        .map_err(|e| JsValue::from_str(&format!("load scene {scene_url}: {e}")))?;
+    post_progress("compiling core render pipelines + fetching scene… (first visit can take a while — cached after)");
+    let (compiled, scene) =
+        futures::join!(renderer.ensure_config_pipelines(), fetch_scene(&scene_url));
+    let compiled =
+        compiled.map_err(|e| JsValue::from_str(&format!("ensure_config_pipelines: {e}")))?;
+    let scene = scene.map_err(|e| JsValue::from_str(&format!("load scene {scene_url}: {e}")))?;
     tracing::info!(
         "render thread: loaded scene {scene_url} ({} nodes)",
         scene.nodes.len()
     );
-    post_progress(&format!("scene parsed ({} nodes)", scene.nodes.len()));
+    post_progress(&format!(
+        "core pipelines ready ({compiled}) · scene parsed ({} nodes)",
+        scene.nodes.len()
+    ));
 
     // Find the ball's *mesh* node. The renderer's shared-arena mode is FLAT —
     // every transform slot holds an absolute world matrix with no parent→child
@@ -279,11 +305,23 @@ async fn run(
     // `media/bundle`). `HttpAssets` is the loader's ready-made web asset source
     // (feature = "http"), so the template carries no bespoke fetching glue.
     let assets = awsm_renderer_scene_loader::assets::HttpAssets::new(bundle_base.clone());
+    // `LoadPhase::label()` is the loader's human-readable progress line
+    // ("Fetching textures 3/9…"), deduped — several phases re-report the same
+    // counts back-to-back, which reads as log spam rather than progress.
+    let mut last_phase_line = String::new();
     let loaded = awsm_renderer_scene_loader::load_scene_for_player(
         &mut renderer,
         &scene,
         &assets,
-        |phase| post_progress(&format!("loader: {phase:?}")),
+        |phase| {
+            let line = phase.label();
+            // "0/0" phases are commit bookkeeping over an empty registry —
+            // noise, not progress.
+            if line != last_phase_line && !line.contains("0/0") {
+                post_progress(&line);
+                last_phase_line = line;
+            }
+        },
     )
     .await
     .map_err(|e| JsValue::from_str(&format!("load_scene_for_player: {e}")))?;
@@ -292,19 +330,15 @@ async fn run(
     // light node (the `Sun`, plus any you add in the editor). No code-side lights.
 
     // Relay GPU-commit progress, deduped (the callback fires per resolution).
+    // This commit is normally a cheap no-op — the loader already ran the real
+    // one — so most loads print nothing here.
     let mut last_commit_line = String::new();
     renderer
         .commit_load(|stats| {
-            let line = format!(
-                "gpu commit: {:?} — geometry {}/{}, textures {}/{}, pipelines pending {}",
-                stats.phase,
-                stats.geometry_uploaded,
-                stats.geometry_total,
-                stats.textures_uploaded,
-                stats.textures_total,
-                stats.pipelines_pending
-            );
-            if line != last_commit_line {
+            let Some(line) = stats.phase_label() else {
+                return;
+            };
+            if line != last_commit_line && !line.contains("0/0") {
                 post_progress(&line);
                 last_commit_line = line;
             }

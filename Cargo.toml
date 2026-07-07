@@ -32,10 +32,10 @@ box3d-sys = { path = "packages/box3d-sys" }
 # deserializer; `awsm-renderer-scene-loader` runs the *player* load path
 # (`load_scene_for_player`) that a shipped game uses; `awsm-renderer-core`
 # exposes the WebGPU builder.
-awsm-renderer = "0.18.0"
-awsm-renderer-core = "0.18.0"
-awsm-renderer-scene = "0.18.0"
-awsm-renderer-scene-loader = { version = "0.18.0", features = ["http"] }
+awsm-renderer = "0.20.0"
+awsm-renderer-core = "0.20.0"
+awsm-renderer-scene = "0.20.0"
+awsm-renderer-scene-loader = { version = "0.20.0", features = ["http"] }
 
 # ── Audio (awsm-audio runtime) ───────────────────────────────────────────────
 # `awsm-audio-player` plays a saved awsm-audio project live; `awsm-audio-schema`

@@ -517,14 +517,25 @@ fn about_modal(open: &Mutable<bool>) -> dominator::Dom {
 /// present from the first byte so "loading code…" shows during the wasm
 /// fetch). No-op once the overlay is gone.
 pub fn loading_log(message: &str) {
-    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+    let Some(window) = web_sys::window() else {
         return;
     };
+    let Some(document) = window.document() else {
+        return;
+    };
+    // Stamp each line with elapsed seconds since navigation — the gaps between
+    // stamps are what tell us (and users filing reports) where a load stalls.
+    let elapsed = window
+        .performance()
+        .map(|p| p.now() / 1000.0)
+        .unwrap_or_default();
+    let message = format!("[{elapsed:6.2}s] {message}");
+    web_sys::console::log_1(&JsValue::from_str(&format!("loading: {message}")));
     let Some(log) = document.get_element_by_id("loading-log") else {
         return;
     };
     if let Ok(line) = document.create_element("div") {
-        line.set_text_content(Some(message));
+        line.set_text_content(Some(&message));
         let _ = log.append_child(&line);
         // Keep the tail visible (the box masks/fades older lines).
         while log.child_element_count() > 14 {

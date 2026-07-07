@@ -245,34 +245,35 @@ async fn run(
         desired_aa.0, desired_aa.1
     ));
 
-    // `build()` no longer compiles ANY pipeline — it reserves them. We know
-    // our config right here (AA rode the spawn payload), so warm the whole
-    // set now, as its own labeled step, instead of letting the loader's
-    // commit absorb it mid-load. First visit really compiles (the browser
-    // caches from then on); warm visits are a no-op.
-    post_progress("compiling core render pipelines… (first visit can take a while — cached after)");
-    let compiled = renderer
-        .ensure_config_pipelines()
-        .await
-        .map_err(|e| JsValue::from_str(&format!("ensure_config_pipelines: {e}")))?;
-    post_progress(&format!("core render pipelines ready ({compiled} compiled)"));
-
     // Shared mode must be enabled BEFORE the load so every scene node gets an
     // arena slot — the sphere's slot is then foreign-writable by physics.
     renderer.transforms.enable_shared_arena();
 
-    // ── Load the exported scene via the PLAYER path ─────────────────────────
+    // ── Warm-up + scene fetch, CONCURRENTLY ─────────────────────────────────
+    // `build()` compiled NO pipeline — it only reserved them. We know our config
+    // here (AA rode the spawn payload), so we warm exactly that set now via
+    // `ensure_config_pipelines` (only what's needed — not an eager compile of
+    // everything). That warm-up is GPU/driver work; the `scene.toml` fetch is
+    // network work; the two share no data, so we run them under one `join!` and
+    // let the single-threaded executor interleave them — the compile hides the
+    // fetch latency instead of following it. First visit really compiles (the
+    // browser caches from then on); warm visits are a no-op.
     let bundle_base = format!("{}/bundle", origin.trim_end_matches('/'));
     let scene_url = format!("{bundle_base}/scene.toml");
-    post_progress("fetching scene.toml…");
-    let scene = fetch_scene(&scene_url)
-        .await
-        .map_err(|e| JsValue::from_str(&format!("load scene {scene_url}: {e}")))?;
+    post_progress("compiling core render pipelines + fetching scene… (first visit can take a while — cached after)");
+    let (compiled, scene) =
+        futures::join!(renderer.ensure_config_pipelines(), fetch_scene(&scene_url));
+    let compiled =
+        compiled.map_err(|e| JsValue::from_str(&format!("ensure_config_pipelines: {e}")))?;
+    let scene = scene.map_err(|e| JsValue::from_str(&format!("load scene {scene_url}: {e}")))?;
     tracing::info!(
         "render thread: loaded scene {scene_url} ({} nodes)",
         scene.nodes.len()
     );
-    post_progress(&format!("scene parsed ({} nodes)", scene.nodes.len()));
+    post_progress(&format!(
+        "core pipelines ready ({compiled}) · scene parsed ({} nodes)",
+        scene.nodes.len()
+    ));
 
     // Find the ball's *mesh* node. The renderer's shared-arena mode is FLAT —
     // every transform slot holds an absolute world matrix with no parent→child

@@ -32,57 +32,6 @@ bloom = false
 dof = false
 exposure = -1.0
 
-[assets.2dc11eab-f349-467e-b25a-c707f3cfcf7e]
-gltf_material_asset_ids = []
-gltf_image_asset_ids = []
-content_hash = ""
-
-[assets.2dc11eab-f349-467e-b25a-c707f3cfcf7e.source.mesh.primitive.box]
-dims = [
-    1.0,
-    1.0,
-    1.0,
-]
-
-[assets.ff9bec40-49f9-44cf-8a53-d245f955480c]
-gltf_material_asset_ids = []
-gltf_image_asset_ids = []
-content_hash = "5e8c1696af50e78c56fb5d719bf3a15c5be54f18055844ec60ff58d1b4181776"
-
-[assets.ff9bec40-49f9-44cf-8a53-d245f955480c.source.texture.raster]
-display_name = "dark_wood_nor_gl_1k.png"
-color_kind = "normal"
-
-[assets.6d2fc755-9dd1-419e-a635-310d7e28fd74]
-gltf_material_asset_ids = []
-gltf_image_asset_ids = []
-content_hash = "5b978ea2f5083fade03d85718086c4c0e34fc52489837b14f39b39acffc79c23"
-
-[assets.6d2fc755-9dd1-419e-a635-310d7e28fd74.source.texture.raster]
-display_name = "ball_billiard3.png"
-color_kind = "albedo"
-
-[assets.8b7f0c8f-ba34-41bd-9be7-f13c470d927f]
-gltf_material_asset_ids = []
-gltf_image_asset_ids = []
-content_hash = "ab30f374b1b8480495d7edb921a6fe73f946cead6efa2044b6eb8e0dccc10dce"
-
-[assets.8b7f0c8f-ba34-41bd-9be7-f13c470d927f.source.texture.raster]
-display_name = "felt2_albedo.png"
-color_kind = "albedo"
-
-[assets.c38fa11e-12e6-4bbd-be09-b0b1c0fce39f]
-gltf_material_asset_ids = []
-gltf_image_asset_ids = []
-content_hash = ""
-
-[assets.c38fa11e-12e6-4bbd-be09-b0b1c0fce39f.source.mesh.primitive.box]
-dims = [
-    1.0,
-    1.0,
-    1.0,
-]
-
 [assets.97e1977a-f938-4821-a01d-bc6323b9ef72]
 gltf_material_asset_ids = []
 gltf_image_asset_ids = []
@@ -95,59 +44,25 @@ dims = [
     1.0,
 ]
 
-[assets.973b391a-c58a-4740-aa7d-dc193730fd1c]
+[assets.83d45df8-4ce2-4d2f-84f0-174f12ed5a66]
 gltf_material_asset_ids = []
 gltf_image_asset_ids = []
-content_hash = "a7188e2e6808a2403913f0ddae00a9979f1bf1860f71a9743132de3a218d57c7"
+content_hash = "1dcbb4fc8f7ca1f866e9469d3d2db994313b278deb1c38bdddef25a0205b2d01"
+texture_encoding = "png"
 
-[assets.973b391a-c58a-4740-aa7d-dc193730fd1c.source.texture.raster]
-display_name = "felt2_mr.png"
-color_kind = "metallic_roughness"
+[assets.83d45df8-4ce2-4d2f-84f0-174f12ed5a66.source.texture.raster]
+display_name = "dark_wood_diff_1k.png"
+color_kind = "albedo"
 
-[assets.6783132a-1f59-4e7f-9ca7-2a4448316e35]
+[assets.8b7f0c8f-ba34-41bd-9be7-f13c470d927f]
 gltf_material_asset_ids = []
 gltf_image_asset_ids = []
-content_hash = ""
+content_hash = "ab30f374b1b8480495d7edb921a6fe73f946cead6efa2044b6eb8e0dccc10dce"
+texture_encoding = "png"
 
-[assets.6783132a-1f59-4e7f-9ca7-2a4448316e35.source.mesh.primitive.sphere]
-radius = 0.5
-segments_long = 32
-segments_lat = 16
-
-[assets.384af2f1-1251-492c-8e63-309ea21eb137]
-gltf_material_asset_ids = []
-gltf_image_asset_ids = []
-content_hash = ""
-
-[assets.384af2f1-1251-492c-8e63-309ea21eb137.source.mesh.primitive.sphere]
-radius = 0.5
-segments_long = 32
-segments_lat = 16
-
-[assets.50c69cd7-bf31-46ec-b534-99f2e93907ee]
-gltf_material_asset_ids = []
-gltf_image_asset_ids = []
-content_hash = ""
-
-[assets.50c69cd7-bf31-46ec-b534-99f2e93907ee.source]
-filename = "sky_dark2.ktx2"
-
-[assets.045ba5dd-0f72-47f4-bfb3-00cd3879ea41]
-gltf_material_asset_ids = []
-gltf_image_asset_ids = []
-content_hash = ""
-
-[assets.045ba5dd-0f72-47f4-bfb3-00cd3879ea41.source]
-filename = "ornament_spec_v2.ktx2"
-
-[assets.137f0dd4-4d5b-41b4-ab80-8832d30da9c9]
-gltf_material_asset_ids = []
-gltf_image_asset_ids = []
-content_hash = "ec481ae2ffce4aac982819aeed3ccc6e70c58317fb80dbf493db0e45e13d5ec8"
-
-[assets.137f0dd4-4d5b-41b4-ab80-8832d30da9c9.source.texture.raster]
-display_name = "felt2_normal.png"
-color_kind = "normal"
+[assets.8b7f0c8f-ba34-41bd-9be7-f13c470d927f.source.texture.raster]
+display_name = "felt2_albedo.png"
+color_kind = "albedo"
 
 [assets.58171de2-d36d-4cbe-9c7d-e72118614331]
 gltf_material_asset_ids = []
@@ -165,45 +80,43 @@ dims = [
 gltf_material_asset_ids = []
 gltf_image_asset_ids = []
 content_hash = "aabf95de273813366c0e799ed91a5ebe7e8d856c636bf4fc4192076285af7a0b"
+texture_encoding = "png"
 
 [assets.a126a74e-a73b-4d59-aa87-ed7f0aab157a.source.texture.raster]
 display_name = "ball_billiard3_red.png"
 color_kind = "albedo"
 
-[assets.b6b28a02-ac62-425a-9505-961bbdceab0b]
-gltf_material_asset_ids = []
-gltf_image_asset_ids = []
-content_hash = "6961e08e8eca17f3dc44c5ed291f1f0d730efef496aaf397994ee0bd42a958a8"
-
-[assets.b6b28a02-ac62-425a-9505-961bbdceab0b.source.texture.raster]
-display_name = "dark_wood_arm_1k.png"
-color_kind = "occlusion"
-
-[assets.83d45df8-4ce2-4d2f-84f0-174f12ed5a66]
-gltf_material_asset_ids = []
-gltf_image_asset_ids = []
-content_hash = "1dcbb4fc8f7ca1f866e9469d3d2db994313b278deb1c38bdddef25a0205b2d01"
-
-[assets.83d45df8-4ce2-4d2f-84f0-174f12ed5a66.source.texture.raster]
-display_name = "dark_wood_diff_1k.png"
-color_kind = "albedo"
-
-[assets.376bfd49-1b7a-4c8d-9b1e-56c9fd2f7ee7]
-gltf_material_asset_ids = []
-gltf_image_asset_ids = []
-content_hash = "a9a8decbfef26131310bd223f994f5a44e59be58ee3fab11b44ce92f63051bc1"
-
-[assets.376bfd49-1b7a-4c8d-9b1e-56c9fd2f7ee7.source.texture.raster]
-display_name = "ball_billiard2_mr.png"
-color_kind = "metallic_roughness"
-
-[assets.e82de494-4577-4576-bc02-785b931f0ad0]
+[assets.c38fa11e-12e6-4bbd-be09-b0b1c0fce39f]
 gltf_material_asset_ids = []
 gltf_image_asset_ids = []
 content_hash = ""
 
-[assets.e82de494-4577-4576-bc02-785b931f0ad0.source]
-filename = "ornament_irr3.ktx2"
+[assets.c38fa11e-12e6-4bbd-be09-b0b1c0fce39f.source.mesh.primitive.box]
+dims = [
+    1.0,
+    1.0,
+    1.0,
+]
+
+[assets.973b391a-c58a-4740-aa7d-dc193730fd1c]
+gltf_material_asset_ids = []
+gltf_image_asset_ids = []
+content_hash = "a7188e2e6808a2403913f0ddae00a9979f1bf1860f71a9743132de3a218d57c7"
+texture_encoding = "png"
+
+[assets.973b391a-c58a-4740-aa7d-dc193730fd1c.source.texture.raster]
+display_name = "felt2_mr.png"
+color_kind = "metallic_roughness"
+
+[assets.384af2f1-1251-492c-8e63-309ea21eb137]
+gltf_material_asset_ids = []
+gltf_image_asset_ids = []
+content_hash = ""
+
+[assets.384af2f1-1251-492c-8e63-309ea21eb137.source.mesh.primitive.sphere]
+radius = 0.5
+segments_long = 32
+segments_lat = 16
 
 [assets.90eee8bd-c1bc-4fc8-a920-d81a2718098a]
 gltf_material_asset_ids = []
@@ -216,6 +129,78 @@ dims = [
     1.0,
     1.0,
 ]
+
+[assets.6783132a-1f59-4e7f-9ca7-2a4448316e35]
+gltf_material_asset_ids = []
+gltf_image_asset_ids = []
+content_hash = ""
+
+[assets.6783132a-1f59-4e7f-9ca7-2a4448316e35.source.mesh.primitive.sphere]
+radius = 0.5
+segments_long = 32
+segments_lat = 16
+
+[assets.137f0dd4-4d5b-41b4-ab80-8832d30da9c9]
+gltf_material_asset_ids = []
+gltf_image_asset_ids = []
+content_hash = "ec481ae2ffce4aac982819aeed3ccc6e70c58317fb80dbf493db0e45e13d5ec8"
+texture_encoding = "png"
+
+[assets.137f0dd4-4d5b-41b4-ab80-8832d30da9c9.source.texture.raster]
+display_name = "felt2_normal.png"
+color_kind = "normal"
+
+[assets.2dc11eab-f349-467e-b25a-c707f3cfcf7e]
+gltf_material_asset_ids = []
+gltf_image_asset_ids = []
+content_hash = ""
+
+[assets.2dc11eab-f349-467e-b25a-c707f3cfcf7e.source.mesh.primitive.box]
+dims = [
+    1.0,
+    1.0,
+    1.0,
+]
+
+[assets.6d2fc755-9dd1-419e-a635-310d7e28fd74]
+gltf_material_asset_ids = []
+gltf_image_asset_ids = []
+content_hash = "5b978ea2f5083fade03d85718086c4c0e34fc52489837b14f39b39acffc79c23"
+texture_encoding = "png"
+
+[assets.6d2fc755-9dd1-419e-a635-310d7e28fd74.source.texture.raster]
+display_name = "ball_billiard3.png"
+color_kind = "albedo"
+
+[assets.ff9bec40-49f9-44cf-8a53-d245f955480c]
+gltf_material_asset_ids = []
+gltf_image_asset_ids = []
+content_hash = "5e8c1696af50e78c56fb5d719bf3a15c5be54f18055844ec60ff58d1b4181776"
+texture_encoding = "png"
+
+[assets.ff9bec40-49f9-44cf-8a53-d245f955480c.source.texture.raster]
+display_name = "dark_wood_nor_gl_1k.png"
+color_kind = "normal"
+
+[assets.b6b28a02-ac62-425a-9505-961bbdceab0b]
+gltf_material_asset_ids = []
+gltf_image_asset_ids = []
+content_hash = "6961e08e8eca17f3dc44c5ed291f1f0d730efef496aaf397994ee0bd42a958a8"
+texture_encoding = "png"
+
+[assets.b6b28a02-ac62-425a-9505-961bbdceab0b.source.texture.raster]
+display_name = "dark_wood_arm_1k.png"
+color_kind = "occlusion"
+
+[assets.376bfd49-1b7a-4c8d-9b1e-56c9fd2f7ee7]
+gltf_material_asset_ids = []
+gltf_image_asset_ids = []
+content_hash = "a9a8decbfef26131310bd223f994f5a44e59be58ee3fab11b44ce92f63051bc1"
+texture_encoding = "png"
+
+[assets.376bfd49-1b7a-4c8d-9b1e-56c9fd2f7ee7.source.texture.raster]
+display_name = "ball_billiard2_mr.png"
+color_kind = "metallic_roughness"
 
 [mixer]
 layers = []

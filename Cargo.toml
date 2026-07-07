@@ -32,10 +32,10 @@ box3d-sys = { path = "packages/box3d-sys" }
 # deserializer; `awsm-renderer-scene-loader` runs the *player* load path
 # (`load_scene_for_player`) that a shipped game uses; `awsm-renderer-core`
 # exposes the WebGPU builder.
-awsm-renderer = "0.18.0"
-awsm-renderer-core = "0.18.0"
-awsm-renderer-scene = "0.18.0"
-awsm-renderer-scene-loader = { version = "0.18.0", features = ["http"] }
+awsm-renderer = "0.20.0"
+awsm-renderer-core = "0.20.0"
+awsm-renderer-scene = "0.20.0"
+awsm-renderer-scene-loader = { version = "0.20.0", features = ["http"] }
 
 # ── Audio (awsm-audio runtime) ───────────────────────────────────────────────
 # `awsm-audio-player` plays a saved awsm-audio project live; `awsm-audio-schema`
@@ -105,10 +105,3 @@ codegen-units = 1
 # Remove this once a fixed dominator is published to crates.io.
 [patch.crates-io]
 dominator = { git = "https://github.com/Pauan/rust-dominator", rev = "25597cd" }
-
-# TEMPORARY (verification): local renderer with the deferred/pooled pipeline
-# compiles (lazy-pipeline-compiles branch). Remove once 0.18.1 is published.
-awsm-renderer = { path = "../../renderer/packages/crates/renderer" }
-awsm-renderer-core = { path = "../../renderer/packages/crates/renderer-core" }
-awsm-renderer-scene = { path = "../../renderer/packages/crates/scene" }
-awsm-renderer-scene-loader = { path = "../../renderer/packages/crates/scene-loader" }

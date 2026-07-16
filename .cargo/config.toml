@@ -13,10 +13,15 @@ rustflags = [
 # awsm-renderer (0.21+) pulls in the `meshopt` crate, which compiles the official
 # meshoptimizer C++ library via `cc`. Apple clang has no WebAssembly backend
 # ("no available targets are compatible with triple wasm32-unknown-unknown"), so
-# point cc at Homebrew LLVM for this target only. Requires `brew install llvm`
-# (any recent version). On Linux the system clang has a wasm backend — set these
-# to /usr/bin/clang, /usr/bin/clang++, /usr/bin/llvm-ar (or override via the
-# CC_wasm32-unknown-unknown / CXX_… / AR_… environment variables).
+# point cc at Homebrew LLVM for this target only. Requires `brew install llvm`.
+#
+# This is a macOS FALLBACK for builds that bypass the Taskfile (a bare
+# `cargo check`, rust-analyzer). `task` (and therefore CI) exports resolved,
+# PORTABLE CC/CXX/AR that OVERRIDE these — an exported env var wins over a config
+# `[env]` value — so Linux/CI uses its stock wasm-capable clang and never sees
+# this macOS path. See the `env:` block in Taskfile.yml. On a non-macOS machine
+# without the Taskfile, override via the CC_wasm32-unknown-unknown / CXX_… / AR_…
+# environment variables (or just build through `task`).
 [env]
 CC_wasm32-unknown-unknown = "/opt/homebrew/opt/llvm/bin/clang"
 CXX_wasm32-unknown-unknown = "/opt/homebrew/opt/llvm/bin/clang++"

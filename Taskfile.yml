@@ -7,6 +7,19 @@ vars:
   # Dev media server (see `media-dev`): the repo's media/ served OUTSIDE Trunk
   # so editor exports don't trigger a rebuild/reload storm.
   PORT_MEDIA: "9001"
+  # Directory of a wasm-capable clang for meshopt's `cc` build (Apple clang has
+  # no wasm backend). Empty => a wasm-capable `clang` is already on PATH, i.e.
+  # Linux/CI — use the bare tool names. Honors a preset $CC_wasm32_unknown_unknown.
+  # Same probe order as `preflight`.
+  LLVM_BIN:
+    sh: |
+      if [ -n "$CC_wasm32_unknown_unknown" ]; then
+        case "$CC_wasm32_unknown_unknown" in */*) dirname "$CC_wasm32_unknown_unknown" ;; *) echo ;; esac
+      elif /opt/homebrew/opt/llvm/bin/clang --print-targets 2>/dev/null | grep -q wasm32; then echo /opt/homebrew/opt/llvm/bin
+      elif /usr/local/opt/llvm/bin/clang --print-targets 2>/dev/null | grep -q wasm32; then echo /usr/local/opt/llvm/bin
+      elif clang --print-targets 2>/dev/null | grep -q wasm32; then echo
+      else echo
+      fi
   # The THREADED build profile. These pieces together produce a wasm bundle
   # that imports a SHARED `WebAssembly.Memory` (real wasm threads), which the
   # whole main/physics/renderer split rests on:
@@ -32,6 +45,17 @@ vars:
     -C link-arg=--export=__tls_size
     -C link-arg=--export=__tls_align
     -C link-arg=--export=__wasm_init_tls
+
+# meshopt (pulled in transitively by awsm-renderer) compiles the meshoptimizer
+# C++ library via `cc`, which reads these per-target env vars. Resolved here so
+# the toolchain is PORTABLE: on Linux/CI `LLVM_BIN` is empty and these become the
+# stock `clang`/`clang++`/`llvm-ar` on PATH; on macOS they point at Homebrew LLVM
+# (Apple clang can't target wasm). An exported env var overrides `.cargo/config`,
+# so this beats the macOS-only fallback there without editing per machine.
+env:
+  CC_wasm32-unknown-unknown: '{{if .LLVM_BIN}}{{.LLVM_BIN}}/{{end}}clang'
+  CXX_wasm32-unknown-unknown: '{{if .LLVM_BIN}}{{.LLVM_BIN}}/{{end}}clang++'
+  AR_wasm32-unknown-unknown: '{{if .LLVM_BIN}}{{.LLVM_BIN}}/{{end}}llvm-ar'
 
 tasks:
   default:

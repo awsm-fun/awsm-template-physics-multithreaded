@@ -178,15 +178,18 @@ pub fn start(payload: JsValue) -> Result<(), JsValue> {
         .unwrap_or_default();
     // Provide the Basis (KTX2/BasisU) codec URLs — the crate hardcodes none.
     // We run this worker's load path against a `blob:` base, so the URLs must be
-    // ABSOLUTE, built from the APP origin (Trunk copy-file serves
-    // /workers/basis-worker.js + /vendor/basis/… there). This is NOT `origin`
-    // above, which in dev is the separate live-media server (no codec files).
+    // ABSOLUTE. `app_base` is the directory the app is served from (Trunk
+    // copy-file serves workers/basis-worker.js + vendor/basis/… there). It keeps
+    // the deploy PATH, not just the origin, so a subpath deploy (e.g.
+    // /experiments/<slug>/) resolves correctly — a bare origin would 404. It is
+    // also NOT `origin` above, which in dev is the separate live-media server
+    // (no codec files).
     {
-        let app_origin = js_sys::Reflect::get(&payload, &JsValue::from_str("app_origin"))
+        let app_base = js_sys::Reflect::get(&payload, &JsValue::from_str("app_base"))
             .ok()
             .and_then(|v| v.as_string())
             .unwrap_or_default();
-        let base = app_origin.trim_end_matches('/');
+        let base = app_base.trim_end_matches('/');
         configure(BasisWorkerConfig::player(
             format!("{base}/workers/basis-worker.js"),
             format!("{base}/vendor/basis/basis_transcoder.js"),

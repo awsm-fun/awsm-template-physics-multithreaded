@@ -685,16 +685,15 @@ fn setup(
     let payload = js_sys::Object::new();
     set(&payload, "canvas", &offscreen);
     set(&payload, "origin", &JsValue::from_str(&base));
-    // The ACTUAL app origin (where index.html + its copy-file'd /workers +
-    // /vendor/basis are served) — distinct from `origin`/`base` above, which in
-    // dev is the side media server (`MEDIA_BASE`, :9001) that serves the bundle
-    // but NOT the Basis codec files. The render worker uses this to build the
-    // absolute worker/transcoder URLs it hands to the KTX2 codec.
-    set(
-        &payload,
-        "app_origin",
-        &JsValue::from_str(&window.location().origin().unwrap_or_default()),
-    );
+    // The APP base — the directory this page is served from (where index.html +
+    // its copy-file'd `workers/` + `vendor/basis/` live) — distinct from
+    // `origin`/`base` above, which in dev is the side media server (`MEDIA_BASE`,
+    // :9001) that serves the bundle but NOT the Basis codec files. The render
+    // worker builds the absolute worker/transcoder URLs from this. It keeps the
+    // deploy PATH, not just the origin, so a subpath deploy (GitHub Pages
+    // `/<repo>/`, or a CDN `/experiments/<slug>/`) resolves correctly — a bare
+    // origin would 404.
+    set(&payload, "app_base", &JsValue::from_str(&app_base(&window)));
     // The desired startup anti-aliasing rides the spawn payload so the render
     // worker BUILDS at it (no post-`Ready` reconcile recompile).
     set(&payload, "msaa", &JsValue::from_bool(msaa.get()));
@@ -1625,12 +1624,10 @@ fn set(obj: &js_sys::Object, key: &str, value: &JsValue) {
 ///    ALWAYS fetches live media: editor exports are picked up on plain
 ///    reload, with no Trunk rebuild/reload storm and no stale dist copy.
 ///    `task build` doesn't set it, so production builds fall through.
-/// 3. The directory the page is served from — we keep the path (not just the
-///    origin) so it's correct under a GitHub Pages project base like
-///    `/<repo>/`; `{base}/bundle/scene.toml` then resolves alongside
-///    `index.html`.
-///    `/foo/bar/` → `https://host/foo/bar`, `/foo/index.html` →
-///    `https://host/foo`, `/` → `https://host`.
+/// 3. The directory the page is served from ([`app_base`]) — the production
+///    path; correct under a subpath deploy (`/<repo>/`, `/experiments/<slug>/`)
+///    because it keeps the path, so `{base}/bundle/scene.toml` resolves
+///    alongside `index.html`.
 ///
 /// Cross-origin media is fine: everything goes through `fetch` (CORS), which
 /// COEP permits when the media server sends `Access-Control-Allow-Origin`.
@@ -1650,6 +1647,21 @@ fn page_base(window: &web_sys::Window) -> String {
             return base.trim_end_matches('/').to_string();
         }
     }
+    app_base(window)
+}
+
+/// The directory THIS PAGE is served from — origin + the path up to (not
+/// including) the trailing `/` — with no trailing slash. This is where Trunk
+/// lays the app down: `index.html`, the wasm/JS glue, and the copy-file'd
+/// `workers/` + `vendor/basis/`. Keeping the path makes it correct at any
+/// deployment depth: the root (`/`), a GitHub Pages project site (`/<repo>/`),
+/// or a CDN subpath (`/experiments/<slug>/`). Unlike [`page_base`], it never
+/// redirects to the media server, so it always points at the app's own files.
+///   `https://host/experiments/foo/`           → `https://host/experiments/foo`
+///   `https://host/experiments/foo/index.html` → `https://host/experiments/foo`
+///   `http://127.0.0.1:9000/`                   → `http://127.0.0.1:9000`
+fn app_base(window: &web_sys::Window) -> String {
+    let location = window.location();
     let origin = location.origin().unwrap_or_default();
     let mut path = location.pathname().unwrap_or_default();
     // Drop the trailing filename (or trailing slash), keeping the directory.

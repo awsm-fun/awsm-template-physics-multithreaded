@@ -127,11 +127,15 @@ tasks:
     desc: "Production build into dist/ (threaded profile)"
     deps: [preflight]
     dir: packages/frontend
-    # PUBLIC_URL defaults to "/" (root host). GitHub Pages serves a project
-    # site under "/<repo>/", so the deploy workflow overrides it:
-    #   task build PUBLIC_URL="/<repo>/"
+    # PUBLIC_URL defaults to "./" — RELATIVE asset links, so the build works
+    # unchanged wherever it's served: the root, a GitHub Pages project site
+    # (`/<repo>/`), or a CDN subpath (`/experiments/<slug>/`). Override only if
+    # you need an absolute base:
+    #   task build PUBLIC_URL="https://cdn.example.com/foo/"
+    # (The Basis worker/transcoder URLs are resolved at runtime from the page's
+    # own location — see `app_base` in main_thread.rs — so they follow suit.)
     vars:
-      PUBLIC_URL: '{{.PUBLIC_URL | default "/"}}'
+      PUBLIC_URL: '{{.PUBLIC_URL | default "./"}}'
     env:
       RUSTFLAGS: "{{.THREADED_RUSTFLAGS}}"
       CARGO_UNSTABLE_BUILD_STD: "std,panic_abort"

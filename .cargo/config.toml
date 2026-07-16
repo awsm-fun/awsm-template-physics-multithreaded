@@ -10,22 +10,31 @@ rustflags = [
     "--cfg=getrandom_backend=\"wasm_js\"",
 ]
 
-# awsm-renderer (0.21+) pulls in the `meshopt` crate, which compiles the official
-# meshoptimizer C++ library via `cc`. Apple clang has no WebAssembly backend
-# ("no available targets are compatible with triple wasm32-unknown-unknown"), so
-# point cc at Homebrew LLVM for this target only. Requires `brew install llvm`.
+# The `meshopt` crate (pulled in transitively by awsm-renderer 0.21+) compiles
+# the meshoptimizer C++ library to wasm via the `cc` crate. Apple's system clang
+# has NO wasm backend ("no available targets are compatible with triple
+# wasm32-unknown-unknown"), so on macOS `cc` must be pointed at a real LLVM.
 #
-# This is a macOS FALLBACK for builds that bypass the Taskfile (a bare
-# `cargo check`, rust-analyzer). `task` (and therefore CI) exports resolved,
-# PORTABLE CC/CXX/AR that OVERRIDE these — an exported env var wins over a config
-# `[env]` value — so Linux/CI uses its stock wasm-capable clang and never sees
-# this macOS path. See the `env:` block in Taskfile.yml. On a non-macOS machine
-# without the Taskfile, override via the CC_wasm32-unknown-unknown / CXX_… / AR_…
-# environment variables (or just build through `task`).
+# --- What these two entries are ---------------------------------------------
+# A macOS FALLBACK, hardcoding the Homebrew LLVM path (`brew install llvm`).
+# Adjust it if your LLVM lives elsewhere (e.g. Intel-mac Homebrew is under
+# /usr/local; Linux is normally /usr). `cc` finds the matching `llvm-ar`
+# archiver sitting next to the compiler on its own, so there's nothing else to
+# set here.
+#
+# --- Why it's only a fallback (and why CI doesn't break on this Mac path) ----
+# You normally build through `task` (trunk and CI do), and its `env:` block in
+# Taskfile.yml exports a RESOLVED, portable CC/CXX that OVERRIDES the values
+# here — an exported environment variable wins over a cargo config `[env]`
+# value. That's how Linux/CI uses its own stock wasm-capable clang and never
+# touches this macOS path. These entries matter only for builds that BYPASS
+# `task`: a bare `cargo check`, or rust-analyzer in your editor.
+#
+# On a non-macOS machine building WITHOUT `task`, set CC_wasm32-unknown-unknown /
+# CXX_wasm32-unknown-unknown yourself (or just build through `task`).
 [env]
 CC_wasm32-unknown-unknown = "/opt/homebrew/opt/llvm/bin/clang"
 CXX_wasm32-unknown-unknown = "/opt/homebrew/opt/llvm/bin/clang++"
-AR_wasm32-unknown-unknown = "/opt/homebrew/opt/llvm/bin/llvm-ar"
 
 # Mirror the cfg on native targets so editor tooling doesn't error out.
 [target.'cfg(not(target_arch = "wasm32"))']

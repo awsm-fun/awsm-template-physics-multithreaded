@@ -46,16 +46,18 @@ vars:
     -C link-arg=--export=__tls_align
     -C link-arg=--export=__wasm_init_tls
 
-# meshopt (pulled in transitively by awsm-renderer) compiles the meshoptimizer
-# C++ library via `cc`, which reads these per-target env vars. Resolved here so
-# the toolchain is PORTABLE: on Linux/CI `LLVM_BIN` is empty and these become the
-# stock `clang`/`clang++`/`llvm-ar` on PATH; on macOS they point at Homebrew LLVM
-# (Apple clang can't target wasm). An exported env var overrides `.cargo/config`,
-# so this beats the macOS-only fallback there without editing per machine.
+# Point meshopt's `cc` build (meshoptimizer C++ -> wasm) at a wasm-capable
+# compiler, PORTABLY — this is what makes the build work on both macOS and
+# Linux/CI without a per-machine edit:
+#   * LLVM_BIN empty  => Linux/CI: stock `clang`/`clang++` on PATH.
+#   * LLVM_BIN set    => macOS: Homebrew LLVM (Apple clang can't emit wasm).
+# We deliberately set NO archiver: `cc` finds the matching `llvm-ar` next to the
+# compiler itself (bare `llvm-ar` is often not on PATH — e.g. GitHub's Ubuntu
+# only ships versioned `llvm-ar-NN`), exactly as box3d-sys's build.rs relies on.
+# An exported env var overrides the macOS-only fallback in .cargo/config.toml.
 env:
   CC_wasm32-unknown-unknown: '{{if .LLVM_BIN}}{{.LLVM_BIN}}/{{end}}clang'
   CXX_wasm32-unknown-unknown: '{{if .LLVM_BIN}}{{.LLVM_BIN}}/{{end}}clang++'
-  AR_wasm32-unknown-unknown: '{{if .LLVM_BIN}}{{.LLVM_BIN}}/{{end}}llvm-ar'
 
 tasks:
   default:

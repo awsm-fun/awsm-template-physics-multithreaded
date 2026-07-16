@@ -28,14 +28,17 @@ publish = false
 box3d-sys = { path = "packages/box3d-sys" }
 
 # ── The renderer + the player-bundle loader ─────────────────────────────────
-# `awsm-renderer-scene` gives us the runtime `Scene` type + the `scene.toml`
-# deserializer; `awsm-renderer-scene-loader` runs the *player* load path
-# (`load_scene_for_player`) that a shipped game uses; `awsm-renderer-core`
-# exposes the WebGPU builder.
-awsm-renderer = "0.20.0"
-awsm-renderer-core = "0.20.0"
-awsm-renderer-scene = "0.20.0"
-awsm-renderer-scene-loader = { version = "0.20.0", features = ["http"] }
+# The complete direct dependency surface for a PLAYER — render + load:
+#   awsm-renderer              the renderer (re-exports the WebGPU builder as
+#                              `awsm_renderer::core`, so no direct -core dep)
+#   awsm-renderer-scene        the runtime `Scene` type + `scene.toml` deserializer
+#   awsm-renderer-scene-loader the player load path (`load_scene_for_player`) a
+#                              shipped game uses; also re-exports the Basis KTX2
+#                              transcoder config as `scene_loader::basis`, so no
+#                              direct -codec-basis dep.
+awsm-renderer = "0.22.0"
+awsm-renderer-scene = "0.22.0"
+awsm-renderer-scene-loader = { version = "0.22.0", features = ["http"] }
 
 # ── Audio (awsm-audio runtime) ───────────────────────────────────────────────
 # `awsm-audio-player` plays a saved awsm-audio project live; `awsm-audio-schema`
@@ -44,8 +47,8 @@ awsm-renderer-scene-loader = { version = "0.20.0", features = ["http"] }
 # `project.toml` (the schema crate only derives serde).
 awsm-audio-player = "2.5"
 awsm-audio-schema = "2.5"
-awsm-audio-worklet = "2"
-toml = "0.8"
+awsm-audio-worklet = "2.5"
+toml = "1"
 
 # ── DOM, driven from pure Rust ──────────────────────────────────────────────
 # NOTE: the published dominator 0.5.38 is incompatible with
@@ -55,10 +58,12 @@ futures = "0.3"
 futures-signals = "0.3"
 
 # ── glue ────────────────────────────────────────────────────────────────────
-# Pinned to the exact wasm-bindgen / web-sys / js-sys set awsm-renderer 0.15 is
-# built and tested against (and that the patched dominator works with).
+# Pinned to the exact wasm-bindgen / web-sys / js-sys set awsm-renderer 0.21 is
+# built and tested against (and that the patched dominator works with). glam is
+# kept at the renderer's 0.32 too: glam types cross the renderer API boundary,
+# so a mismatched major would fail to type-check.
 glam = "0.32"
-gloo-net = { version = "0.6", features = ["http"] }
+gloo-net = { version = "0.7", features = ["http"] }
 wasm-bindgen = "=0.2.118"
 wasm-bindgen-futures = "=0.4.68"
 js-sys = "=0.3.95"

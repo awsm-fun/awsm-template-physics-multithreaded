@@ -96,6 +96,20 @@
          shared-memory bootstrap. -->
     <link data-trunk rel="rust" data-wasm-opt="0" />
 
+    <!-- Vendored Basis TRANSCODER + its worker (runtime KTX2/BasisU texture
+         load — the editor bakes material textures as Basis-supercompressed
+         KTX2 by default). The codec crate has NO built-in URLs: the frontend
+         provides them via `configure(BasisWorkerConfig::player(worker_url,
+         transcoder_url))` (see render_thread.rs), pointing at these copied
+         files — served same-origin at the APP origin (COEP require-corp demands
+         it anyway; the render worker builds ABSOLUTE URLs from that origin
+         since its own base is `blob:`). Change the paths below and the two
+         `format!` URLs in render_thread.rs together. The ENCODER is editor-only
+         — never ship it in a player. See web/vendor/basis/. -->
+    <link data-trunk rel="copy-file" href="../../web/vendor/basis/basis_transcoder.js" data-target-path="vendor/basis" />
+    <link data-trunk rel="copy-file" href="../../web/vendor/basis/basis_transcoder.wasm" data-target-path="vendor/basis" />
+    <link data-trunk rel="copy-file" href="../../web/workers/basis-worker.js" data-target-path="workers" />
+
     <!-- Bundle the editor-exported scene SAME-ORIGIN. COEP `require-corp`
          blocks cross-origin fetches, so the render worker must load the scene
          from our own origin. `media/bundle` is the scene editor's player

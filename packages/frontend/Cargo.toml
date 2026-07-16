@@ -13,8 +13,12 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # ── The renderer + the player-bundle loader ──────────────────────────────────
+# A player needs exactly two things: RENDER (`awsm-renderer`, which re-exports
+# the WebGPU builder as `awsm_renderer::core`) and LOAD (`awsm-renderer-scene`
+# for the `Scene`/`scene.toml` types, `awsm-renderer-scene-loader` for the
+# player load path — which also re-exports the Basis KTX2 config as
+# `scene_loader::basis`). Nothing else from the renderer graph is a direct dep.
 awsm-renderer.workspace = true
-awsm-renderer-core.workspace = true
 awsm-renderer-scene.workspace = true
 awsm-renderer-scene-loader.workspace = true
 

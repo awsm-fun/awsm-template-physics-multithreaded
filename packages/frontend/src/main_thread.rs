@@ -685,6 +685,16 @@ fn setup(
     let payload = js_sys::Object::new();
     set(&payload, "canvas", &offscreen);
     set(&payload, "origin", &JsValue::from_str(&base));
+    // The ACTUAL app origin (where index.html + its copy-file'd /workers +
+    // /vendor/basis are served) — distinct from `origin`/`base` above, which in
+    // dev is the side media server (`MEDIA_BASE`, :9001) that serves the bundle
+    // but NOT the Basis codec files. The render worker uses this to build the
+    // absolute worker/transcoder URLs it hands to the KTX2 codec.
+    set(
+        &payload,
+        "app_origin",
+        &JsValue::from_str(&window.location().origin().unwrap_or_default()),
+    );
     // The desired startup anti-aliasing rides the spawn payload so the render
     // worker BUILDS at it (no post-`Ready` reconcile recompile).
     set(&payload, "msaa", &JsValue::from_bool(msaa.get()));

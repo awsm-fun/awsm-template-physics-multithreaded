@@ -36,9 +36,9 @@ box3d-sys = { path = "packages/box3d-sys" }
 #                              shipped game uses; also re-exports the Basis KTX2
 #                              transcoder config as `scene_loader::basis`, so no
 #                              direct -codec-basis dep.
-awsm-renderer = "0.22.0"
-awsm-renderer-scene = "0.22.0"
-awsm-renderer-scene-loader = { version = "0.22.0", features = ["http"] }
+awsm-renderer = "0.25.0"
+awsm-renderer-scene = "0.25.0"
+awsm-renderer-scene-loader = { version = "0.25.0", features = ["http"] }
 
 # ── Audio (awsm-audio runtime) ───────────────────────────────────────────────
 # `awsm-audio-player` plays a saved awsm-audio project live; `awsm-audio-schema`
@@ -58,7 +58,7 @@ futures = "0.3"
 futures-signals = "0.3"
 
 # ── glue ────────────────────────────────────────────────────────────────────
-# Pinned to the exact wasm-bindgen / web-sys / js-sys set awsm-renderer 0.21 is
+# Pinned to the exact wasm-bindgen / web-sys / js-sys set awsm-renderer 0.25 is
 # built and tested against (and that the patched dominator works with). glam is
 # kept at the renderer's 0.32 too: glam types cross the renderer API boundary,
 # so a mismatched major would fail to type-check.

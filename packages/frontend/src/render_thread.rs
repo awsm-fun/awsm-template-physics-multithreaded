@@ -104,6 +104,13 @@ impl SyncStats {
 /// red tint so yours reads instantly against the silver click-dropped balls.
 const PLAYER_TINT: [f32; 4] = [1.0, 0.25, 0.2, 1.0];
 
+/// Lens + clip planes for the one camera this app has. Shared by the render
+/// path (`set_camera`) and the click-unprojection so the two can't drift apart
+/// — a mismatch here silently drops balls in the wrong place.
+const CAMERA_FOV_Y_DEG: f32 = 55.0;
+const CAMERA_NEAR: f32 = 0.1;
+const CAMERA_FAR: f32 = 400.0;
+
 /// A minimal mouse-driven orbit camera (after the renderer's `model-tests`
 /// `OrbitCamera`): it circles a fixed `look_at` point at spherical
 /// `(yaw, pitch, radius)`. Right-drag to orbit, wheel to dolly (no pan — the
@@ -232,7 +239,7 @@ async fn run(
     origin: String,
     desired_aa: (bool, bool),
 ) -> Result<(), JsValue> {
-    use awsm_renderer::camera::CameraMatrices;
+    use awsm_renderer::camera::CameraParams;
     use awsm_renderer::AwsmRendererBuilder;
 
     // Tell main the GPU's capabilities up front (before the slow scene load)
@@ -751,24 +758,17 @@ async fn run(
         }
 
         let cam = camera_loop.borrow();
-        let eye = cam.eye();
-        // Build the projection under the renderer's own depth convention
-        // (0.21 defaults to reverse-Z): `CameraMatrices::perspective` fills in
-        // `projection`/`reverse_z`/`near`/`far` consistently. Hand-rolling a
-        // forward-Z `perspective_rh` here would invert every depth test.
-        let mut matrices = CameraMatrices::perspective(
-            r.features().depth(),
-            eye,
-            cam.look_at,
-            Vec3::Y,
-            55.0_f32.to_radians(),
-            aspect(&canvas),
-            0.1,
-            400.0,
-        );
-        matrices.focus_distance = cam.radius;
-        matrices.aperture = 5.6;
-        let _ = r.update_camera(matrices);
+        // ONE camera API: a view matrix plus projection params. The renderer
+        // supplies the depth convention (reverse-Z by default) and the live
+        // surface aspect itself, so neither can drift from what it actually
+        // renders with — hand-rolling a projection here would invert every
+        // depth test. Focus on the orbit pivot so DoF tracks the dolly;
+        // aperture stays at the f/5.6 default.
+        let view = Mat4::look_at_rh(cam.eye(), cam.look_at, Vec3::Y);
+        let mut params =
+            CameraParams::perspective(CAMERA_FOV_Y_DEG.to_radians(), CAMERA_NEAR, CAMERA_FAR);
+        params.focus_distance = cam.radius;
+        let _ = r.set_camera(view, params);
         drop(cam);
         // Folds the ball slot we just wrote (plus any other dirty slots) into
         // world matrices for this frame.
@@ -1040,8 +1040,12 @@ fn install_render_input(
             };
             let cam = camera.borrow();
             let view = Mat4::look_at_rh(cam.eye(), cam.look_at, Vec3::Y);
-            let projection =
-                Mat4::perspective_rh(55.0_f32.to_radians(), aspect(&canvas), 0.1, 400.0);
+            let projection = Mat4::perspective_rh(
+                CAMERA_FOV_Y_DEG.to_radians(),
+                aspect(&canvas),
+                CAMERA_NEAR,
+                CAMERA_FAR,
+            );
             drop(cam);
             // Unproject the click ray and intersect the tabletop plane.
             let inv = (projection * view).inverse();

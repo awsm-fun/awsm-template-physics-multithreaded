@@ -62,17 +62,17 @@ temporal = false
 temporal_weight = 0.8999999761581421
 bvh_reflections = false
 
-[assets.2dc11eab-f349-467e-b25a-c707f3cfcf7e]
+[assets.ff9bec40-49f9-44cf-8a53-d245f955480c]
 gltf_material_asset_ids = []
 gltf_image_asset_ids = []
-content_hash = ""
+content_hash = "5e8c1696af50e78c56fb5d719bf3a15c5be54f18055844ec60ff58d1b4181776"
+texture_encoding = "ktx2"
+texture_two_channel_normal = true
+lod = "none"
 
-[assets.2dc11eab-f349-467e-b25a-c707f3cfcf7e.source.mesh.primitive.box]
-dims = [
-    1.0,
-    1.0,
-    1.0,
-]
+[assets.ff9bec40-49f9-44cf-8a53-d245f955480c.source.texture.raster]
+display_name = "dark_wood_nor_gl_1k.png"
+color_kind = "normal"
 
 [assets.137f0dd4-4d5b-41b4-ab80-8832d30da9c9]
 gltf_material_asset_ids = []
@@ -80,6 +80,7 @@ gltf_image_asset_ids = []
 content_hash = "ec481ae2ffce4aac982819aeed3ccc6e70c58317fb80dbf493db0e45e13d5ec8"
 texture_encoding = "ktx2"
 texture_two_channel_normal = true
+lod = "none"
 
 [assets.137f0dd4-4d5b-41b4-ab80-8832d30da9c9.source.texture.raster]
 display_name = "felt2_normal.png"
@@ -90,58 +91,28 @@ gltf_material_asset_ids = []
 gltf_image_asset_ids = []
 content_hash = "1dcbb4fc8f7ca1f866e9469d3d2db994313b278deb1c38bdddef25a0205b2d01"
 texture_encoding = "ktx2"
+lod = "none"
 
 [assets.83d45df8-4ce2-4d2f-84f0-174f12ed5a66.source.texture.raster]
 display_name = "dark_wood_diff_1k.png"
 color_kind = "albedo"
 
-[assets.384af2f1-1251-492c-8e63-309ea21eb137]
+[assets.b6b28a02-ac62-425a-9505-961bbdceab0b]
 gltf_material_asset_ids = []
 gltf_image_asset_ids = []
-content_hash = ""
-
-[assets.384af2f1-1251-492c-8e63-309ea21eb137.source.mesh.primitive.sphere]
-radius = 0.5
-segments_long = 32
-segments_lat = 16
-
-[assets.6783132a-1f59-4e7f-9ca7-2a4448316e35]
-gltf_material_asset_ids = []
-gltf_image_asset_ids = []
-content_hash = ""
-
-[assets.6783132a-1f59-4e7f-9ca7-2a4448316e35.source.mesh.primitive.sphere]
-radius = 0.5
-segments_long = 32
-segments_lat = 16
-
-[assets.ff9bec40-49f9-44cf-8a53-d245f955480c]
-gltf_material_asset_ids = []
-gltf_image_asset_ids = []
-content_hash = "5e8c1696af50e78c56fb5d719bf3a15c5be54f18055844ec60ff58d1b4181776"
+content_hash = "6961e08e8eca17f3dc44c5ed291f1f0d730efef496aaf397994ee0bd42a958a8"
 texture_encoding = "ktx2"
-texture_two_channel_normal = true
+lod = "none"
 
-[assets.ff9bec40-49f9-44cf-8a53-d245f955480c.source.texture.raster]
-display_name = "dark_wood_nor_gl_1k.png"
-color_kind = "normal"
-
-[assets.90eee8bd-c1bc-4fc8-a920-d81a2718098a]
-gltf_material_asset_ids = []
-gltf_image_asset_ids = []
-content_hash = ""
-
-[assets.90eee8bd-c1bc-4fc8-a920-d81a2718098a.source.mesh.primitive.box]
-dims = [
-    1.0,
-    1.0,
-    1.0,
-]
+[assets.b6b28a02-ac62-425a-9505-961bbdceab0b.source.texture.raster]
+display_name = "dark_wood_arm_1k.png"
+color_kind = "occlusion"
 
 [assets.58171de2-d36d-4cbe-9c7d-e72118614331]
 gltf_material_asset_ids = []
 gltf_image_asset_ids = []
 content_hash = ""
+lod = "none"
 
 [assets.58171de2-d36d-4cbe-9c7d-e72118614331.source.mesh.primitive.box]
 dims = [
@@ -150,22 +121,118 @@ dims = [
     1.0,
 ]
 
+[assets.97e1977a-f938-4821-a01d-bc6323b9ef72]
+gltf_material_asset_ids = []
+gltf_image_asset_ids = []
+content_hash = ""
+lod = "none"
+
+[assets.97e1977a-f938-4821-a01d-bc6323b9ef72.source.mesh.primitive.box]
+dims = [
+    1.0,
+    1.0,
+    1.0,
+]
+
+[assets.6d2fc755-9dd1-419e-a635-310d7e28fd74]
+gltf_material_asset_ids = []
+gltf_image_asset_ids = []
+content_hash = "5b978ea2f5083fade03d85718086c4c0e34fc52489837b14f39b39acffc79c23"
+texture_encoding = "ktx2"
+lod = "none"
+
+[assets.6d2fc755-9dd1-419e-a635-310d7e28fd74.source.texture.raster]
+display_name = "ball_billiard3.png"
+color_kind = "albedo"
+
+[assets.384af2f1-1251-492c-8e63-309ea21eb137]
+gltf_material_asset_ids = []
+gltf_image_asset_ids = []
+content_hash = ""
+lod = "none"
+
+[assets.384af2f1-1251-492c-8e63-309ea21eb137.source.mesh.primitive.sphere]
+radius = 0.5
+segments_long = 32
+segments_lat = 16
+
+[assets.2dc11eab-f349-467e-b25a-c707f3cfcf7e]
+gltf_material_asset_ids = []
+gltf_image_asset_ids = []
+content_hash = ""
+lod = "none"
+
+[assets.2dc11eab-f349-467e-b25a-c707f3cfcf7e.source.mesh.primitive.box]
+dims = [
+    1.0,
+    1.0,
+    1.0,
+]
+
+[assets.a126a74e-a73b-4d59-aa87-ed7f0aab157a]
+gltf_material_asset_ids = []
+gltf_image_asset_ids = []
+content_hash = "aabf95de273813366c0e799ed91a5ebe7e8d856c636bf4fc4192076285af7a0b"
+texture_encoding = "ktx2"
+lod = "none"
+
+[assets.a126a74e-a73b-4d59-aa87-ed7f0aab157a.source.texture.raster]
+display_name = "ball_billiard3_red.png"
+color_kind = "albedo"
+
+[assets.973b391a-c58a-4740-aa7d-dc193730fd1c]
+gltf_material_asset_ids = []
+gltf_image_asset_ids = []
+content_hash = "a7188e2e6808a2403913f0ddae00a9979f1bf1860f71a9743132de3a218d57c7"
+texture_encoding = "ktx2"
+lod = "none"
+
+[assets.973b391a-c58a-4740-aa7d-dc193730fd1c.source.texture.raster]
+display_name = "felt2_mr.png"
+color_kind = "metallic_roughness"
+
+[assets.6783132a-1f59-4e7f-9ca7-2a4448316e35]
+gltf_material_asset_ids = []
+gltf_image_asset_ids = []
+content_hash = ""
+lod = "none"
+
+[assets.6783132a-1f59-4e7f-9ca7-2a4448316e35.source.mesh.primitive.sphere]
+radius = 0.5
+segments_long = 32
+segments_lat = 16
+
 [assets.8b7f0c8f-ba34-41bd-9be7-f13c470d927f]
 gltf_material_asset_ids = []
 gltf_image_asset_ids = []
 content_hash = "ab30f374b1b8480495d7edb921a6fe73f946cead6efa2044b6eb8e0dccc10dce"
 texture_encoding = "ktx2"
+lod = "none"
 
 [assets.8b7f0c8f-ba34-41bd-9be7-f13c470d927f.source.texture.raster]
 display_name = "felt2_albedo.png"
 color_kind = "albedo"
 
-[assets.97e1977a-f938-4821-a01d-bc6323b9ef72]
+[assets.c38fa11e-12e6-4bbd-be09-b0b1c0fce39f]
 gltf_material_asset_ids = []
 gltf_image_asset_ids = []
 content_hash = ""
+lod = "none"
 
-[assets.97e1977a-f938-4821-a01d-bc6323b9ef72.source.mesh.primitive.box]
+[assets.c38fa11e-12e6-4bbd-be09-b0b1c0fce39f.source.mesh.primitive.box]
+dims = [
+    1.0,
+    1.0,
+    1.0,
+]
+
+[assets.90eee8bd-c1bc-4fc8-a920-d81a2718098a]
+gltf_material_asset_ids = []
+gltf_image_asset_ids = []
+content_hash = ""
+lod = "none"
+
+[assets.90eee8bd-c1bc-4fc8-a920-d81a2718098a.source.mesh.primitive.box]
 dims = [
     1.0,
     1.0,
@@ -177,62 +244,11 @@ gltf_material_asset_ids = []
 gltf_image_asset_ids = []
 content_hash = "a9a8decbfef26131310bd223f994f5a44e59be58ee3fab11b44ce92f63051bc1"
 texture_encoding = "ktx2"
+lod = "none"
 
 [assets.376bfd49-1b7a-4c8d-9b1e-56c9fd2f7ee7.source.texture.raster]
 display_name = "ball_billiard2_mr.png"
 color_kind = "metallic_roughness"
-
-[assets.6d2fc755-9dd1-419e-a635-310d7e28fd74]
-gltf_material_asset_ids = []
-gltf_image_asset_ids = []
-content_hash = "5b978ea2f5083fade03d85718086c4c0e34fc52489837b14f39b39acffc79c23"
-texture_encoding = "ktx2"
-
-[assets.6d2fc755-9dd1-419e-a635-310d7e28fd74.source.texture.raster]
-display_name = "ball_billiard3.png"
-color_kind = "albedo"
-
-[assets.a126a74e-a73b-4d59-aa87-ed7f0aab157a]
-gltf_material_asset_ids = []
-gltf_image_asset_ids = []
-content_hash = "aabf95de273813366c0e799ed91a5ebe7e8d856c636bf4fc4192076285af7a0b"
-texture_encoding = "ktx2"
-
-[assets.a126a74e-a73b-4d59-aa87-ed7f0aab157a.source.texture.raster]
-display_name = "ball_billiard3_red.png"
-color_kind = "albedo"
-
-[assets.973b391a-c58a-4740-aa7d-dc193730fd1c]
-gltf_material_asset_ids = []
-gltf_image_asset_ids = []
-content_hash = "a7188e2e6808a2403913f0ddae00a9979f1bf1860f71a9743132de3a218d57c7"
-texture_encoding = "ktx2"
-
-[assets.973b391a-c58a-4740-aa7d-dc193730fd1c.source.texture.raster]
-display_name = "felt2_mr.png"
-color_kind = "metallic_roughness"
-
-[assets.b6b28a02-ac62-425a-9505-961bbdceab0b]
-gltf_material_asset_ids = []
-gltf_image_asset_ids = []
-content_hash = "6961e08e8eca17f3dc44c5ed291f1f0d730efef496aaf397994ee0bd42a958a8"
-texture_encoding = "ktx2"
-
-[assets.b6b28a02-ac62-425a-9505-961bbdceab0b.source.texture.raster]
-display_name = "dark_wood_arm_1k.png"
-color_kind = "occlusion"
-
-[assets.c38fa11e-12e6-4bbd-be09-b0b1c0fce39f]
-gltf_material_asset_ids = []
-gltf_image_asset_ids = []
-content_hash = ""
-
-[assets.c38fa11e-12e6-4bbd-be09-b0b1c0fce39f.source.mesh.primitive.box]
-dims = [
-    1.0,
-    1.0,
-    1.0,
-]
 
 [mixer]
 layers = []
@@ -405,7 +421,7 @@ cast = true
 receive = true
 
 [nodes.children.kind.mesh.lod]
-enabled = true
+kind = "none"
 
 [[nodes.children]]
 id = "c38fa11e-12e6-4bbd-be09-b0b1c0fce39f"
@@ -567,7 +583,7 @@ cast = true
 receive = true
 
 [nodes.children.kind.mesh.lod]
-enabled = true
+kind = "none"
 
 [[nodes.children]]
 id = "90eee8bd-c1bc-4fc8-a920-d81a2718098a"
@@ -729,7 +745,7 @@ cast = true
 receive = true
 
 [nodes.children.kind.mesh.lod]
-enabled = true
+kind = "none"
 
 [[nodes.children]]
 id = "58171de2-d36d-4cbe-9c7d-e72118614331"
@@ -891,7 +907,7 @@ cast = true
 receive = true
 
 [nodes.children.kind.mesh.lod]
-enabled = true
+kind = "none"
 
 [[nodes.children]]
 id = "97e1977a-f938-4821-a01d-bc6323b9ef72"
@@ -1053,7 +1069,7 @@ cast = true
 receive = true
 
 [nodes.children.kind.mesh.lod]
-enabled = true
+kind = "none"
 
 [[nodes.children]]
 id = "124e483d-7781-4401-8870-51acdf7bb840"
@@ -1375,7 +1391,7 @@ cast = true
 receive = true
 
 [nodes.children.kind.mesh.lod]
-enabled = true
+kind = "none"
 
 [[nodes.children]]
 id = "65e0782c-a4ae-4249-bf89-fbe5fa73b06d"

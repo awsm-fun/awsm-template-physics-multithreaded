@@ -36,9 +36,9 @@ box3d-sys = { path = "packages/box3d-sys" }
 #                              shipped game uses; also re-exports the Basis KTX2
 #                              transcoder config as `scene_loader::basis`, so no
 #                              direct -codec-basis dep.
-awsm-renderer = "0.30.0"
-awsm-renderer-scene = "0.30.0"
-awsm-renderer-scene-loader = { version = "0.30.0", features = ["http"] }
+awsm-renderer = "0.32.0"
+awsm-renderer-scene = "0.32.0"
+awsm-renderer-scene-loader = { version = "0.32.0", features = ["http"] }
 
 # ── Audio (awsm-audio runtime) ───────────────────────────────────────────────
 # `awsm-audio-player` plays a saved awsm-audio project live; `awsm-audio-schema`

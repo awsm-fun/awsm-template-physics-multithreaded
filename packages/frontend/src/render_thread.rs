@@ -970,7 +970,9 @@ fn collider_shape_msg(
             half_height: half_height * s.y,
             radius: radius * radial,
         },
-        S::Ellipsoid { .. } => return None,
+        // Unused in this scene (and the Box3D wire has no hull/ellipsoid
+        // shape) — dropped, same policy as Ellipsoid always had.
+        S::Ellipsoid { .. } | S::ConvexHull { .. } => return None,
     })
 }
 

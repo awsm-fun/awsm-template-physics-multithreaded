@@ -36,9 +36,9 @@ box3d-sys = { path = "packages/box3d-sys" }
 #                              shipped game uses; also re-exports the Basis KTX2
 #                              transcoder config as `scene_loader::basis`, so no
 #                              direct -codec-basis dep.
-awsm-renderer = "0.32.0"
-awsm-renderer-scene = "0.32.0"
-awsm-renderer-scene-loader = { version = "0.32.0", features = ["http"] }
+awsm-renderer = "0.40.0"
+awsm-renderer-scene = "0.40.0"
+awsm-renderer-scene-loader = { version = "0.40.0", features = ["http"] }
 
 # ── Audio (awsm-audio runtime) ───────────────────────────────────────────────
 # `awsm-audio-player` plays a saved awsm-audio project live; `awsm-audio-schema`
@@ -60,7 +60,7 @@ futures-signals = "0.3"
 # ── glue ────────────────────────────────────────────────────────────────────
 # Pinned to one internally-consistent wasm-bindgen / web-sys / js-sys set (the
 # -sys crates `=`-pin their wasm-bindgen, so these four move together). It is
-# semver-compatible with the `^`-ranges awsm-renderer 0.30 declares, and matches
+# semver-compatible with the `^`-ranges awsm-renderer 0.40 declares, and matches
 # the wasm-bindgen-cli trunk drives. glam is kept at the renderer's 0.32: glam
 # types cross the renderer API boundary, so a mismatched major (0.33 is out)
 # would fail to type-check.

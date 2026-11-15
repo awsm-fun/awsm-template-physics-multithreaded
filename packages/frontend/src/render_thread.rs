@@ -260,6 +260,13 @@ async fn run(
     // core GPU resources — takes visible time here.
     let mut renderer = AwsmRendererBuilder::new(gpu_builder)
         .with_anti_aliasing(aa_config(desired_aa))
+        // GPU frame timing for the stats panel's "gpu time" line: `Frame` tier
+        // = timestamp queries on the renderer's passes, folded into one
+        // whole-frame span (cheap; silently off without `timestamp-query`).
+        .with_logging(awsm_renderer::debug::AwsmRendererLogging {
+            gpu: awsm_renderer::debug::TimingTier::Frame,
+            ..Default::default()
+        })
         .with_phase_handler(|phase| {
             use awsm_renderer::RendererLoadingPhase as P;
             let message = match phase {
@@ -567,6 +574,8 @@ async fn run(
     let mut err_ema: f64 = 0.0;
     let mut sync_stats = SyncStats::default();
     let mut frame_count: u32 = 0;
+    // Last GPU-timing sample count published to the stats panel.
+    let mut gpu_samples_seen: u64 = 0;
     // One arena binding per minted (dropped-ball) visual duplicate.
     let mut ball_bindings: Vec<awsm_renderer::buffer::shared_arena::SlotBinding> = Vec::new();
 
@@ -779,6 +788,16 @@ async fn run(
         r.update_transforms();
         if let Err(err) = r.render(None) {
             tracing::warn!("render thread: render error: {err}");
+        }
+
+        // Publish the renderer's GPU frame-time totals for the stats panel
+        // (timestamp-query readbacks land a few frames late; only push when a
+        // new sample arrived).
+        if let Some(gpu) = awsm_renderer::profiling::gpu_frame_timing() {
+            if gpu.count != gpu_samples_seen {
+                gpu_samples_seen = gpu.count;
+                motion.set_gpu_totals((gpu.total_ms * 1000.0) as u64 as u32, gpu.count as u32);
+            }
         }
 
         // Frame presented — wake physics to advance the sim for the next one, so

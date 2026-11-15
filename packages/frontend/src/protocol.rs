@@ -364,6 +364,18 @@ pub struct BodyMotion {
     /// absorb observed publish burstiness (see the render thread's cursor);
     /// published here for the stats panel's sync line.
     display_lag_bits: AtomicU32,
+    /// GPU frame time, accumulated, in MICROSECONDS (wrapping): the renderer's
+    /// running total of measured whole-frame GPU time
+    /// (`awsm_renderer::profiling::gpu_frame_timing`, timestamp queries), as
+    /// last published by the render thread. With [`Self::gpu_samples`] the
+    /// stats panel gets avg GPU ms/frame over its window — the number that
+    /// says whether a frame can make vsync, which the CPU `frame_work_us`
+    /// can't (the submit returns long before the GPU finishes).
+    gpu_total_us: AtomicU32,
+    /// How many GPU frame samples [`Self::gpu_total_us`] sums (wrapping). The
+    /// readback is single-buffered, so this counts fewer than `frame_tick`.
+    /// Stays 0 on a device without `timestamp-query`.
+    gpu_samples: AtomicU32,
 }
 
 impl BodyMotion {
@@ -376,7 +388,25 @@ impl BodyMotion {
             step_work_us: AtomicU32::new(0),
             sync_err_bits: AtomicU32::new(0),
             display_lag_bits: AtomicU32::new(0),
+            gpu_total_us: AtomicU32::new(0),
+            gpu_samples: AtomicU32::new(0),
         }
+    }
+
+    /// Render side: publish the renderer's cumulative GPU frame time (µs) and
+    /// sample count. Stored as absolute (wrapping) values — readers diff them.
+    pub fn set_gpu_totals(&self, total_us: u32, samples: u32) {
+        self.gpu_total_us.store(total_us, Ordering::Relaxed);
+        self.gpu_samples.store(samples, Ordering::Relaxed);
+    }
+
+    /// Stats side: `(total GPU µs, samples)`, both wrapping — diff two reads
+    /// for the window's average GPU frame time.
+    pub fn gpu_totals(&self) -> (u32, u32) {
+        (
+            self.gpu_total_us.load(Ordering::Relaxed),
+            self.gpu_samples.load(Ordering::Relaxed),
+        )
     }
 
     /// Render side: record this frame's display-cursor |error| (steps).

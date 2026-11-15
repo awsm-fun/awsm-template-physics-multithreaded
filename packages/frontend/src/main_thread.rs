@@ -23,7 +23,9 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::js_sys;
-use web_sys::{HtmlCanvasElement, HtmlInputElement, KeyboardEvent, MessageEvent, Worker};
+use web_sys::{
+    HtmlCanvasElement, HtmlInputElement, HtmlSelectElement, KeyboardEvent, MessageEvent, Worker,
+};
 
 use crate::audio::AudioController;
 use crate::bootstrap::{spawn_shared_worker, spawn_shared_worker_transfer};
@@ -41,9 +43,20 @@ type Audio = Rc<RefCell<Option<AudioController>>>;
 // The canvas renders at `devicePixelRatio × scale` device pixels. Fill rate —
 // not geometry — bounds this scene, so on a weak GPU (or a high-DPR phone)
 // dropping this fraction is what buys the framerate back. It's the user's to
-// set (the bottom-right slider); we only pick the STARTING point, and only when
-// they haven't already chosen one. Screen SIZE never touches this — a big
-// display on a fast GPU keeps native — only device CLASS seeds a lower start.
+// set (the bottom-right slider); we only pick the DEFAULT, and only while they
+// haven't chosen one.
+//
+// The default is native resolution capped at a PIXEL BUDGET
+// ([`DEFAULT_PIXEL_BUDGET`]), further capped by device class (touch / software
+// GPU). An earlier version kept native on any desktop ("a big display on a
+// fast GPU keeps native"), but measurement disproved that premise: a Retina
+// MacBook (M1 Max) at native 2400×1794 ran this scene's GPU frame at ~10 ms —
+// over a 120 Hz display's 8.3 ms — so it presented ~90 fps while the CPU stat
+// read 0.4 ms. The renderer's per-pixel cost (a deferred, compute-driven
+// pipeline) scales with pixel count, so the budget is in pixels, not DPR, and a
+// small window keeps native. It never drops below an effective DPR of 1 (a
+// default softer than CSS resolution reads as blurry), so a DPR-1 display —
+// even a large 4K one — keeps native by default; its user has the slider.
 /// Floor of the slider (50% of native). Below this the image turns to mush for
 /// little further gain; the slider's `min` in `index.html` mirrors it.
 const MIN_SCALE: f64 = 0.5;
@@ -55,6 +68,10 @@ const COARSE_START_SCALE: f64 = 0.6;
 /// Start on a software / fallback adapter — it genuinely can't push pixels, so
 /// seed lower still. Applied when the render worker reports the adapter.
 const FALLBACK_START_SCALE: f64 = 0.5;
+/// Backing-store pixels the DEFAULT resolution allows (see the section note).
+/// A 1200×897 CSS window at DPR 2 (4.3 MP native) defaults to ~80%. The user's
+/// slider still goes to 100%.
+const DEFAULT_PIXEL_BUDGET: f64 = 2_800_000.0;
 /// Max 2D texture dimension assumed until the render worker reports the real
 /// one (WebGPU guarantees at least this). Caps the backing store so a huge
 /// display can't ask for a canvas larger than the GPU allows.
@@ -72,6 +89,9 @@ struct ResState {
     css_w: f64,
     css_h: f64,
     dpr: f64,
+    /// Device-class ceiling for the DEFAULT scale: [`MAX_SCALE`], or lower on
+    /// a touch device / software GPU. Never applied over a user choice.
+    auto_cap: f64,
 }
 
 impl ResState {
@@ -83,6 +103,24 @@ impl ResState {
         let h = ((self.css_h * s).round() as u32).clamp(1, self.max_tex);
         (w, h)
     }
+
+    /// The default scale for the current size: native, capped by the pixel
+    /// budget and the device-class ceiling, floored at an effective DPR of 1
+    /// (and the slider's range).
+    fn auto_scale(&self) -> f64 {
+        let native_px = self.css_w * self.css_h * self.dpr * self.dpr;
+        let budget = if native_px > DEFAULT_PIXEL_BUDGET {
+            (DEFAULT_PIXEL_BUDGET / native_px)
+                .sqrt()
+                .max(1.0 / self.dpr)
+        } else {
+            MAX_SCALE
+        };
+        // Round DOWN to the slider's 5% step so the thumb, its label and the
+        // real scale agree (the browser would snap an 81% value to 80).
+        let stepped = (budget.min(self.auto_cap) * 20.0).floor() / 20.0;
+        stepped.clamp(MIN_SCALE, MAX_SCALE)
+    }
 }
 
 /// Percent form of a scale fraction (0.6 → 60) — the slider's unit.
@@ -90,13 +128,10 @@ fn pct_of(scale: f64) -> u32 {
     (scale * 100.0).round() as u32
 }
 
-/// The scale to start at: a stored user choice if there is one, else a lower
-/// seed on a touch device, else native. (A fallback GPU lowers it further once
-/// the render worker reports in — see the `GpuInfo` handler.)
-fn initial_scale(window: &web_sys::Window) -> f64 {
-    if let Some(stored) = stored_scale(window) {
-        return stored;
-    }
+/// The device-class ceiling for the default scale: lower on a touch device.
+/// (A fallback GPU lowers it further once the render worker reports in — see
+/// the `GpuInfo` handler.)
+fn initial_auto_cap(window: &web_sys::Window) -> f64 {
     if coarse_pointer(window) {
         COARSE_START_SCALE
     } else {
@@ -143,23 +178,112 @@ fn post_resize(render: &Worker, st: &ResState) {
     }
 }
 
-// ── Anti-aliasing settings ───────────────────────────────────────────────────
-// Two independent renderer toggles, exposed in the Settings modal and persisted.
-// MSAA 4× matches the renderer's own default; SMAA we default ON (the renderer
-// builds with it off, so main applies it once on `Ready` — see that handler).
-const MSAA_STORAGE_KEY: &str = "awsm_msaa";
-const SMAA_STORAGE_KEY: &str = "awsm_smaa";
+// ── Anti-aliasing setting ────────────────────────────────────────────────────
+// ONE three-way choice in the Settings modal, persisted: Off / SMAA / MSAA 4×.
+// MSAA+SMAA together isn't offered: on top of a 4× MSAA resolve SMAA buys
+// almost nothing (the renderer itself defaults it off for that reason) and
+// costs an extra full-screen pre-pass. SMAA earns its place as the cheap AA
+// when MSAA is off.
+const AA_STORAGE_KEY: &str = "awsm_aa";
+/// The pre-0.42 per-toggle keys — migrated to [`AA_STORAGE_KEY`] once, then
+/// cleared (see [`clear_legacy_aa`]).
+const LEGACY_AA_STORAGE_KEYS: [&str; 2] = ["awsm_msaa", "awsm_smaa"];
 /// `localStorage` key for the stats-panel toggle (default OFF — the panel eats
 /// a lot of a phone screen, so it's opt-in via the bottom-left Stats chip).
 const STATS_STORAGE_KEY: &str = "awsm_stats";
+/// The anti-aliasing modes the Settings modal offers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AaMode {
+    Off,
+    Smaa,
+    Msaa,
+}
+
+impl AaMode {
+    const ALL: [AaMode; 3] = [AaMode::Off, AaMode::Smaa, AaMode::Msaa];
+
+    /// The renderer's `(msaa, smaa)` pair for this mode.
+    fn flags(self) -> (bool, bool) {
+        match self {
+            AaMode::Off => (false, false),
+            AaMode::Smaa => (false, true),
+            AaMode::Msaa => (true, false),
+        }
+    }
+
+    /// Storage / `<option>` value.
+    fn key(self) -> &'static str {
+        match self {
+            AaMode::Off => "off",
+            AaMode::Smaa => "smaa",
+            AaMode::Msaa => "msaa",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            AaMode::Off => "Off",
+            AaMode::Smaa => "SMAA",
+            AaMode::Msaa => "MSAA 4×",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|m| m.key() == s)
+    }
+}
+
 /// Default anti-aliasing on a fine-pointer (desktop) device. On
-/// `pointer: coarse` devices BOTH toggles default OFF instead: like the
+/// `pointer: coarse` devices it defaults to [`AaMode::Off`] instead: like the
 /// [`COARSE_START_SCALE`] resolution seed, the mobile defaults optimize
 /// purely for frame rate — and because that visibly costs quality, a notice
 /// modal points the user at Settings (see `quality_notice_modal`). A stored
-/// user toggle always wins over either default.
-const MSAA_DEFAULT: bool = true;
-const SMAA_DEFAULT: bool = true;
+/// user choice always wins over either default.
+const AA_DEFAULT: AaMode = AaMode::Msaa;
+
+/// The persisted anti-aliasing choice, if the user has made one.
+fn stored_aa(window: &web_sys::Window) -> Option<AaMode> {
+    let ls = window.local_storage().ok().flatten()?;
+    AaMode::parse(&ls.get_item(AA_STORAGE_KEY).ok().flatten()?)
+}
+
+/// Persist the user's anti-aliasing choice.
+fn store_aa(window: &web_sys::Window, mode: AaMode) {
+    if let Ok(Some(ls)) = window.local_storage() {
+        let _ = ls.set_item(AA_STORAGE_KEY, mode.key());
+    }
+}
+
+/// Carry an explicit pre-0.42 choice over to [`AA_STORAGE_KEY`], then drop the
+/// legacy per-toggle keys (see [`LEGACY_AA_STORAGE_KEYS`]). The old keys were
+/// only ever written by a user toggle, so they are real choices: MSAA off maps
+/// to SMAA if SMAA was on, else Off; MSAA on maps to MSAA (SMAA alongside it
+/// isn't offered any more). Unset legacy keys leave the new default in place.
+fn clear_legacy_aa(window: &web_sys::Window) {
+    let Ok(Some(ls)) = window.local_storage() else {
+        return;
+    };
+    let get = |k: &str| ls.get_item(k).ok().flatten();
+    let (msaa, smaa) = (
+        get(LEGACY_AA_STORAGE_KEYS[0]),
+        get(LEGACY_AA_STORAGE_KEYS[1]),
+    );
+    if get(AA_STORAGE_KEY).is_none() {
+        let migrated = match (msaa.as_deref(), smaa.as_deref()) {
+            (Some("1"), _) => Some(AaMode::Msaa),
+            (Some("0"), Some("1")) => Some(AaMode::Smaa),
+            (Some("0"), _) => Some(AaMode::Off),
+            (None, Some("1")) => Some(AaMode::Msaa),
+            _ => None,
+        };
+        if let Some(mode) = migrated {
+            let _ = ls.set_item(AA_STORAGE_KEY, mode.key());
+        }
+    }
+    for key in LEGACY_AA_STORAGE_KEYS {
+        let _ = ls.remove_item(key);
+    }
+}
 
 /// Read a persisted boolean setting (`"1"`/`"0"`), `None` if unset.
 fn stored_bool(window: &web_sys::Window, key: &str) -> Option<bool> {
@@ -219,6 +343,8 @@ struct StatsSample {
     step: u32,
     frame_work_us: u32,
     step_work_us: u32,
+    /// Renderer GPU frame-time totals at sample time: (µs, samples), wrapping.
+    gpu: (u32, u32),
     /// Per-executor accumulated task CPU µs (index 0 = the physics thread).
     task_us: Vec<u32>,
 }
@@ -243,8 +369,9 @@ fn maybe_reset_settings(window: &web_sys::Window) {
     if let Ok(Some(ls)) = window.local_storage() {
         for key in [
             RES_STORAGE_KEY,
-            MSAA_STORAGE_KEY,
-            SMAA_STORAGE_KEY,
+            AA_STORAGE_KEY,
+            LEGACY_AA_STORAGE_KEYS[0],
+            LEGACY_AA_STORAGE_KEYS[1],
             STATS_STORAGE_KEY,
         ] {
             let _ = ls.remove_item(key);
@@ -595,13 +722,17 @@ fn setup(
     // driven live by the bottom-right slider (see `install_resolution_control`).
     // Must be sized BEFORE transfer. `max_tex` is refined once the render worker
     // reports the GPU's real limit (the `GpuInfo` handler below).
-    let res = Rc::new(Cell::new(ResState {
-        scale: initial_scale(&window),
+    let mut res0 = ResState {
+        scale: MAX_SCALE,
         max_tex: DEFAULT_MAX_TEX,
         css_w: canvas.client_width().max(1) as f64,
         css_h: canvas.client_height().max(1) as f64,
         dpr: window.device_pixel_ratio().max(1.0),
-    }));
+        auto_cap: initial_auto_cap(&window),
+    };
+    // A stored user choice wins; otherwise the budgeted default.
+    res0.scale = stored_scale(&window).unwrap_or_else(|| res0.auto_scale());
+    let res = Rc::new(Cell::new(res0));
     // Whether the user has an explicit choice — if so, auto-seeding (touch /
     // fallback GPU) must never override it.
     let user_pref = Rc::new(Cell::new(stored_scale(&window).is_some()));
@@ -614,16 +745,9 @@ fn setup(
     // seeds optimize purely for frame rate (a one-time notice modal below
     // tells the user and points at Settings).
     let coarse = coarse_pointer(&window);
-    let msaa = Mutable::new(stored_bool(&window, MSAA_STORAGE_KEY).unwrap_or(if coarse {
-        false
-    } else {
-        MSAA_DEFAULT
-    }));
-    let smaa = Mutable::new(stored_bool(&window, SMAA_STORAGE_KEY).unwrap_or(if coarse {
-        false
-    } else {
-        SMAA_DEFAULT
-    }));
+    clear_legacy_aa(&window);
+    let aa =
+        Mutable::new(stored_aa(&window).unwrap_or(if coarse { AaMode::Off } else { AA_DEFAULT }));
     // ── Reduced-quality notice (touch devices) ──────────────────────────────
     // If any of the coarse-device seeds actually applied (no stored user
     // choice overrode it), quality was visibly traded for frame rate — say so
@@ -631,10 +755,8 @@ fn setup(
     // point at Settings. Shown on EVERY such load — informing the user beats
     // sparing them a dismissal; it goes quiet once they've made their own
     // Settings choices (those persist and replace the seeds).
-    let show_quality_notice = coarse
-        && (stored_scale(&window).is_none()
-            || stored_bool(&window, MSAA_STORAGE_KEY).is_none()
-            || stored_bool(&window, SMAA_STORAGE_KEY).is_none());
+    let show_quality_notice =
+        coarse && (stored_scale(&window).is_none() || stored_aa(&window).is_none());
     let notice_open = Mutable::new(false);
     dominator::append_dom(&dominator::body(), quality_notice_modal(&notice_open));
     // The "compiling pipelines" overlay for runtime AA changes (render-worker-
@@ -696,8 +818,9 @@ fn setup(
     set(&payload, "app_base", &JsValue::from_str(&app_base(&window)));
     // The desired startup anti-aliasing rides the spawn payload so the render
     // worker BUILDS at it (no post-`Ready` reconcile recompile).
-    set(&payload, "msaa", &JsValue::from_bool(msaa.get()));
-    set(&payload, "smaa", &JsValue::from_bool(smaa.get()));
+    let (msaa0, smaa0) = aa.get().flags();
+    set(&payload, "msaa", &JsValue::from_bool(msaa0));
+    set(&payload, "smaa", &JsValue::from_bool(smaa0));
     let transfer = js_sys::Array::new();
     transfer.push(&offscreen);
 
@@ -817,13 +940,16 @@ fn setup(
                     st.max_tex = max_texture_dim.max(1);
                     // A software adapter can't push pixels — seed lower, but
                     // never override a choice the user has already made.
-                    if is_fallback && !user_pref.get() && st.scale > FALLBACK_START_SCALE {
-                        st.scale = FALLBACK_START_SCALE;
-                        res_pct.set(pct_of(FALLBACK_START_SCALE));
-                        loading_log(&format!(
-                            "software GPU detected — starting at {}% resolution",
-                            pct_of(FALLBACK_START_SCALE)
-                        ));
+                    if is_fallback {
+                        st.auto_cap = st.auto_cap.min(FALLBACK_START_SCALE);
+                        if !user_pref.get() && st.scale > st.auto_scale() {
+                            st.scale = st.auto_scale();
+                            res_pct.set(pct_of(st.scale));
+                            loading_log(&format!(
+                                "software GPU detected — starting at {}% resolution",
+                                pct_of(st.scale)
+                            ));
+                        }
                     }
                     res.set(st);
                     // Re-apply with the real texture cap (and any lowered scale).
@@ -868,18 +994,24 @@ fn setup(
     // backing store is CSS size × dpr × the chosen resolution scale. Without
     // this the backing store keeps its initial size and the browser stretches
     // it — circles become ovals after any window resize.
-    install_resize(&window, &canvas, &render, res.clone())?;
+    install_resize(
+        &window,
+        &canvas,
+        &render,
+        res.clone(),
+        user_pref.clone(),
+        res_pct.clone(),
+    )?;
 
     // The bottom-right Settings button + modal: the resolution slider (the
-    // fill-rate lever) plus the MSAA / SMAA toggles. Applies live and persists.
+    // fill-rate lever) plus the anti-aliasing mode. Applies live and persists.
     install_settings(
         window.clone(),
         render.clone(),
         res.clone(),
         user_pref,
         res_pct,
-        msaa,
-        smaa,
+        aa,
     )?;
 
     // Left-clicks drop balls (relayed to render for unprojection); right-drags
@@ -901,6 +1033,8 @@ fn install_resize(
     canvas: &HtmlCanvasElement,
     render: &Worker,
     res: Rc<Cell<ResState>>,
+    user_pref: Rc<Cell<bool>>,
+    res_pct: Mutable<u32>,
 ) -> Result<(), JsValue> {
     let win = window.clone();
     let render = render.clone();
@@ -916,6 +1050,12 @@ fn install_resize(
         st.dpr = win.device_pixel_ratio().max(1.0);
         st.css_w = rect.width().max(1.0);
         st.css_h = rect.height().max(1.0);
+        // The default resolution is size-dependent (pixel budget): re-derive
+        // it — but never over a user's slider choice.
+        if !user_pref.get() {
+            st.scale = st.auto_scale();
+            res_pct.set_neq(pct_of(st.scale));
+        }
         res.set(st);
         post_resize(&render, &st);
     });
@@ -931,12 +1071,12 @@ fn install_resize(
 /// the user's to set. Everything here trades GPU cost for image quality —
 /// exactly the levers that rescue a weak-GPU / high-DPR framerate:
 /// - **Resolution** (the fill-rate lever): renders at `devicePixelRatio × scale`
-///   device pixels. Starting position seeded by [`initial_scale`] (+ the
+///   device pixels. Default from [`ResState::auto_scale`] (+ the
 ///   fallback-GPU nudge in the `GpuInfo` handler); a drag applies live via the
 ///   shared [`ResState`] + [`post_resize`], persists, and marks `user_pref` so no
 ///   auto-seed overrides the human.
-/// - **MSAA 4× / SMAA**: renderer anti-aliasing, applied by the render worker
-///   ([`QualityMsg`] → `set_anti_aliasing`); persisted.
+/// - **Anti-aliasing** (Off / SMAA / MSAA 4×, see [`AaMode`]): applied by the
+///   render worker ([`QualityMsg`] → `set_anti_aliasing`); persisted.
 ///
 /// The modal mirrors the About one (backdrop / Escape close). The controls live
 /// here rather than in `start`'s static DOM because they need the render
@@ -948,8 +1088,7 @@ fn install_settings(
     res: Rc<Cell<ResState>>,
     user_pref: Rc<Cell<bool>>,
     res_pct: Mutable<u32>,
-    msaa: Mutable<bool>,
-    smaa: Mutable<bool>,
+    aa: Mutable<AaMode>,
 ) -> Result<(), JsValue> {
     let open = Mutable::new(false);
 
@@ -994,33 +1133,32 @@ fn install_settings(
         }))
     });
 
-    // A single labelled checkbox row that drives an AA toggle. `read` names the
-    // flag this row owns; both flags are re-read on change so the posted
-    // `QualityMsg` always carries the current pair.
-    let aa_row = |label: &str, flag: Mutable<bool>, key: &'static str, is_msaa: bool| {
-        html!("div", {
-            .class("settings-row")
-            .child(html!("label", { .class("settings-label").text(label) }))
-            .child(html!("input" => HtmlInputElement, {
-                .class("settings-toggle")
-                .attr("type", "checkbox")
-                .attr("aria-label", label)
-                .prop_signal("checked", flag.signal())
-                .with_node!(el => {
-                    .event(clone!(flag, msaa, smaa, window, render => move |_: dominator::events::Change| {
-                        let on = el.checked();
-                        flag.set_neq(on);
-                        store_bool(&window, key, on);
-                        // Read both flags fresh so we post the full pair.
-                        let (m, s) = if is_msaa { (on, smaa.get()) } else { (msaa.get(), on) };
-                        post_quality(&render, m, s);
-                    }))
-                })
-            }))
-        })
-    };
-    let msaa_row = aa_row("MSAA 4×", msaa.clone(), MSAA_STORAGE_KEY, true);
-    let smaa_row = aa_row("SMAA", smaa.clone(), SMAA_STORAGE_KEY, false);
+    // Anti-aliasing: one three-way choice (see [`AaMode`]). A change persists
+    // and posts the renderer's `(msaa, smaa)` pair; the render worker applies
+    // it (recompiling behind the "compiling pipelines" modal).
+    let aa_row = html!("div", {
+        .class("settings-row")
+        .child(html!("label", { .class("settings-label").text("Anti-aliasing") }))
+        .child(html!("select" => HtmlSelectElement, {
+            .class("settings-select")
+            .attr("aria-label", "anti-aliasing")
+            .children(AaMode::ALL.into_iter().map(|m| html!("option", {
+                .attr("value", m.key())
+                .text(m.label())
+            })))
+            .prop_signal("value", aa.signal().map(|m| m.key().to_string()))
+            .with_node!(el => {
+                .event(clone!(aa, window, render => move |_: dominator::events::Change| {
+                    let Some(mode) = AaMode::parse(&el.value()) else { return };
+                    if aa.replace(mode) != mode {
+                        store_aa(&window, mode);
+                        let (msaa, smaa) = mode.flags();
+                        post_quality(&render, msaa, smaa);
+                    }
+                }))
+            })
+        }))
+    });
 
     let modal = html!("div", {
         .class("settings-overlay")
@@ -1049,8 +1187,7 @@ fn install_settings(
             }))
             .child(html!("h2", { .text("Settings") }))
             .child(resolution_row)
-            .child(msaa_row)
-            .child(smaa_row)
+            .child(aa_row)
             .child(html!("p", {
                 .class("settings-hint")
                 .text("Adjust these settings if your framerate is low.")
@@ -1389,7 +1526,11 @@ const STATS_WARMUP_FRAMES: u32 = 60;
 /// - render: presented frames/s (the `BodyMotion` frame-tick). NOTE this is
 ///   real presented fps, so it's vsync-capped — 60 on a 60 Hz display, 120 on
 ///   a 120 Hz one; steady is the goal, not monitor-independent,
-/// - frame time: avg render-thread CPU ms per frame (`frame_work_us` delta
+/// - gpu time: avg whole-frame GPU ms (the renderer's timestamp-query span,
+///   published via `BodyMotion::gpu_totals`) — THE number that says whether a
+///   frame can make vsync: a 120 Hz display allows 8.3 ms. `n/a` when the
+///   device has no `timestamp-query`,
+/// - cpu time: avg render-thread CPU ms per frame (`frame_work_us` delta
 ///   over the frame delta) — the monitor-INDEPENDENT workload metric: what a
 ///   frame actually costs, regardless of what refresh rate it's presented at,
 /// - physics time: avg physics-thread CPU ms per fixed step (same
@@ -1436,6 +1577,10 @@ fn install_stats(
     let mut fps_ema: Option<f64> = None;
     let mut steps_ema: Option<f64> = None;
     let mut frame_work_ema: Option<f64> = None;
+    let mut gpu_ema: Option<f64> = None;
+    // Trusted windows seen with no GPU sample at all — after a few, the device
+    // evidently has no `timestamp-query` and the line says so.
+    let mut gpu_empty_windows: u32 = 0;
     let mut step_work_ema: Option<f64> = None;
     // Consecutive windows the sync condition has been rough (see the doc
     // comment's ROUGH definition) — the line turns red at the threshold.
@@ -1464,6 +1609,10 @@ fn install_stats(
         });
         let (frame, step, frame_work_us, step_work_us, sync_err, lag) =
             motion_counts.unwrap_or((0, 0, 0, 0, 0.0, 0.0));
+        let gpu_totals = refs
+            .motion
+            .map(|addr| unsafe { &*(addr as *const BodyMotion) }.gpu_totals())
+            .unwrap_or((0, 0));
         let task_us = match refs.pool {
             Some((addr, count)) => {
                 let pool = unsafe { &*(addr as *const TaskPool) };
@@ -1477,6 +1626,7 @@ fn install_stats(
             step,
             frame_work_us,
             step_work_us,
+            gpu: gpu_totals,
             task_us: task_us.clone(),
         });
 
@@ -1485,6 +1635,7 @@ fn install_stats(
             steps_ema = None;
             frame_work_ema = None;
             step_work_ema = None;
+            gpu_ema = None;
             stats.set(StatsText {
                 head: "workers\n  main          ui · audio · input\n  render        \
                        starting…\n  physics       starting…"
@@ -1539,6 +1690,22 @@ fn install_stats(
             let w = step_work_ema.get_or_insert(ms);
             *w += (ms - *w) * STATS_EMA_ALPHA;
         }
+        // Avg GPU ms per sampled frame over the window (the readback skips
+        // frames while one is in flight, so divide by GPU samples, not frames).
+        let gpu_samples = gpu_totals.1.wrapping_sub(prev.gpu.1);
+        if gpu_samples > 0 {
+            gpu_empty_windows = 0;
+            let ms = gpu_totals.0.wrapping_sub(prev.gpu.0) as f64 / gpu_samples as f64 / 1000.0;
+            let g = gpu_ema.get_or_insert(ms);
+            *g += (ms - *g) * STATS_EMA_ALPHA;
+        } else {
+            gpu_empty_windows = gpu_empty_windows.saturating_add(1);
+        }
+        let gpu_line = match gpu_ema {
+            Some(g) => format!("{g:.1} ms"),
+            None if gpu_empty_windows >= 3 => "n/a".to_string(),
+            None => "—".to_string(),
+        };
         let cpu = |ema: Option<f64>, digits: usize| match ema {
             Some(w) => format!("{w:.digits$} ms"),
             None => "—".to_string(),
@@ -1546,8 +1713,9 @@ fn install_stats(
 
         let head = format!(
             "workers\n  main          ui · audio · input\n  render        {:.0} fps\n  \
-             frame time    {}\n  physics time  {}\n  physics       {:.0} steps/s\n",
+             gpu time      {}\n  cpu time      {}\n  physics time  {}\n  physics       {:.0} steps/s\n",
             *f,
+            gpu_line,
             cpu(frame_work_ema, 1),
             cpu(step_work_ema, 2),
             *s,

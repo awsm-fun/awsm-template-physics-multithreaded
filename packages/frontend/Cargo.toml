@@ -65,6 +65,7 @@ features = [
     "HtmlElement",
     "HtmlCanvasElement",
     "HtmlInputElement",
+    "HtmlSelectElement",
     "OffscreenCanvas",
     "Location",
     "UrlSearchParams",

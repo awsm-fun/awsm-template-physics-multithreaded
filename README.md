@@ -194,11 +194,14 @@ machine, physics legitimately publishes 3/4/5 steps per 60 Hz frame (honest
 frame-time wobble quantized against the 240 Hz grid). So the render thread
 runs a **display cursor**: it advances on the **vsync timestamp** (the rAF
 argument — never `performance.now()` inside the callback, which adds
-scheduling-delay noise), trails the newest published step by 2 steps, and
-lerp/slerps between the ring's straddling poses. Wake wobble and bursts up to
-the ring depth (16 steps ≈ 67 ms) shift only how far the cursor trails —
-never the uniformity of what's displayed. The 2-step trail is the latency
-price (8.3 ms at 240 Hz; `SIM_HZ` is what keeps it small). Pose is published
+scheduling-delay noise), trails the newest published step by an **adaptive
+lag** (2 steps on a steady machine, growing to at most 24 when publishes
+arrive in bursts, then decaying back), and lerp/slerps between the ring's
+straddling poses. Wake wobble and bursts shift only how far the cursor
+trails — never the uniformity of what's displayed — and the ring
+(`POSE_RING` = 32 steps ≈ 133 ms) holds the worst-case lag with margin. The
+trail is the latency price (8.3 ms at the 2-step floor at 240 Hz; `SIM_HZ`
+is what keeps it small). Pose is published
 as position + quaternion (not a baked matrix) so the reader can `lerp`
 translation and `slerp` rotation correctly.
 
@@ -208,7 +211,7 @@ overshoots on discontinuities, and this scene is all bounces. A twitch-genre
 fork may prefer *extrapolation* (zero display lag, occasional overshoot).
 The pose ring makes that a small, local change in `render_thread.rs`:
 
-- target the cursor at `latest + lead` instead of `latest - TARGET_LAG`, and
+- target the cursor at `latest + lead` instead of `latest - target_lag`, and
 - let `sample_ring` evaluate the newest pose pair with `alpha > 1`
   (an unclamped lerp/slerp is already a first-order predictor).
 
@@ -228,7 +231,7 @@ one-number tuning knob because nothing else is written in "ticks": physical
 quantities (velocities, gravity, damping, `MOVE_ACCEL` as an acceleration) are
 `dt`-invariant, and the few tick counts (`ROLL_EVERY`, `IMPACT_COOLDOWN`,
 `MAX_SUBSTEPS`) are *derived* from `SIM_HZ`, so the feel is identical at any rate.
-Raising it lowers the display-latency floor (the cursor trails 2 steps: ≈8 ms at
+Raising it lowers the display-latency floor (the cursor trails at least 2 steps: ≈8 ms at
 240, ≈33 ms at 60) and tightens collisions, for a linear CPU cost (~0.2 ms per
 step here). The rule when extending: **express any new per-step force per second
 and multiply by the step `dt`** — never bake the rate into a constant.

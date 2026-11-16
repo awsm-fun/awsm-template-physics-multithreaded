@@ -183,7 +183,7 @@ the README ("The threads"). Reference points for future debugging:
 
 - Physics honestly publishes 3/4/5 steps per 60 Hz frame (frame wobble
   quantized against the 240 Hz grid) — a 1-step interpolation window can't
-  absorb it; the 16-step ring + 2-step trailing cursor does.
+  absorb it; the 32-step ring + adaptive trailing cursor (2-step floor) does.
 - Frame time must come from the rAF `DOMHighResTimeStamp` argument, never
   `performance.now()` inside the callback (scheduling delay becomes judder).
 - 1 Hz `sync:` debug telemetry (steps/frame histogram + cursor-err band) in

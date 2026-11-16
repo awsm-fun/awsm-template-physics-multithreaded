@@ -70,7 +70,7 @@ flowchart TB
     MAIN -- "2 · spawns with PhysicsInit" --> PHYS
     MAIN -- "3 · spawns with the TaskPool address" --> POOL
     RENDER -. "RenderMsg: Progress, GpuInfo, PhysicsInit, Ready, AA compile, Error" .-> MAIN
-    MAIN -. "DropMsg, CameraMsg, ResizeMsg, QualityMsg" .-> RENDER
+    MAIN -. "DropMsg, ResizeMsg, QualityMsg" .-> RENDER
     PHYS -. "SpawnTaskWorkers, AudioMsg cues" .-> MAIN
     MAIN -- "voices + live AudioParams" --> AUDIO
     RENDER -. "spawned on demand, buffers transferred" .-> BASIS
@@ -92,14 +92,17 @@ flowchart LR
     subgraph MEM["One shared WebAssembly.Memory · Rust and Box3D C in one wasm module"]
         direction TB
         INPUT[("InputState<br/>held keys · jump · fling · camera yaw")]
+        CAM[("CameraRing<br/>yaw · pitch · radius per main frame")]
         TP[("TaskPool<br/>task slots · semaphore futex · claim counters")]
         WORLD[("Box3D world + solver state")]
-        MOTION[("BodyMotion<br/>player PoseRing · frame-tick futex · timing counters")]
+        MOTION[("BodyMotion<br/>player PoseRing · frame tick + frame time · timing counters")]
         BALLS[("BallMotions<br/>drop request · one PoseRing per dropped ball")]
         ARENA[("Renderer transform arena<br/>one 64-byte matrix slot per body")]
     end
 
     MAIN == "writes on key / touch events" ==> INPUT
+    MAIN == "writes once per main frame" ==> CAM
+    CAM == "read once per render frame" ==> RENDER
     INPUT == "polled every step" ==> PHYS
     PHYS == "enqueues solver tasks" ==> TP
     TP == "CAS-claimed" ==> POOL
@@ -109,16 +112,17 @@ flowchart LR
     PHYS == "publishes poses, bumps count" ==> BALLS
     MOTION == "sampled every frame" ==> RENDER
     BALLS == "sampled every frame" ==> RENDER
-    RENDER == "frame-tick bump wakes physics" ==> MOTION
+    RENDER == "frame time + tick bump wake physics" ==> MOTION
     RENDER == "drop request" ==> BALLS
     RENDER == "interpolated matrix per body" ==> ARENA
 ```
 
 | Shared block | Allocated by | Written by | Read by | Synchronization |
 |---|---|---|---|---|
-| `InputState` | main | main | physics, once per step | relaxed atomics; seq counters edge-detect jumps / flings |
-| `BodyMotion` — pose ring | render | physics, every step | render, every frame | per-slot seqlock tagged with its step |
-| `BodyMotion` — frame tick | render | render, once per presented frame | physics blocks on it | futex (`memory.atomic.wait32` / `notify`) |
+| `InputState` | main | main | physics, once per step | relaxed atomics; seq counters edge-detect jumps / flings; a pressed-since-last-step latch so a quick tap is never lost |
+| `CameraRing` | main | main, once per main frame the camera changed | render, every frame | per-slot seqlock; render takes the newest slot at least half a frame old |
+| `BodyMotion` — pose ring | render | physics, every step | render, every frame | per-slot seqlock tagged with its step and due time |
+| `BodyMotion` — frame tick + frame time | render | render, at the start of every frame | physics blocks on the tick, steps to the time | futex (`memory.atomic.wait32` / `notify`); time stored before the tick (Release / Acquire) |
 | `BodyMotion` — timing counters | render | render + physics | main's 1 Hz stats sampler | relaxed atomics |
 | `BallMotions` — drop request | render | render (from main's `DropMsg`) | physics, once per step | seq counter, Release / Acquire |
 | `BallMotions` — per-ball pose rings + count | render | physics | render, every frame; main (ball count) | seqlock per slot; count is Release / Acquire |
@@ -180,8 +184,8 @@ runtime (the `wasm-bindgen-rayon` pattern — `packages/frontend/src/lib.rs`).
 | Thread | File | Responsibility |
 |---|---|---|
 | **Main** | `packages/frontend/src/main_thread.rs` | Owns the DOM (built with **Dominator**) + keyboard input, and the **WebAudio player** (`packages/frontend/src/audio.rs`). Spawns the render worker, the physics worker, and (on the physics worker's request) the task-pool workers. |
-| **Render** | `packages/frontend/src/render_thread.rs` | Hosts **awsm-renderer** on an `OffscreenCanvas`, loads `scene.toml` via `load_scene_for_player`, derives the collider list (`derive_physics`), and every frame **interpolates** each body's pose and writes it into the transform arena. |
-| **Physics** | `packages/frontend/src/physics_thread.rs` | Runs a **Box3D** world built from the scene's colliders (static table + walls, dynamic ball) at a **fixed step** (`SIM_HZ`, 240 Hz default) with wall-clock catch-up, **paced by the render thread's frame-tick**, polls input from shared memory, publishes each step’s pose into shared pose rings, and emits audio cues from contact events. |
+| **Render** | `packages/frontend/src/render_thread.rs` | Hosts **awsm-renderer** on an `OffscreenCanvas`, loads `scene.toml` via `load_scene_for_player`, derives the collider list (`derive_physics`), and every frame publishes its frame time (pacing physics), **interpolates** each body's pose at the previous frame's time and writes it into the transform arena. |
+| **Physics** | `packages/frontend/src/physics_thread.rs` | Runs a **Box3D** world built from the scene's colliders (static table + walls, dynamic ball) at a **fixed step** (`SIM_HZ`, 240 Hz default), catching up to **the render thread's published frame time** each frame, polls input from shared memory, publishes each step’s pose into shared pose rings, and emits audio cues from contact events. |
 | **Task pool ×N** | `packages/frontend/src/physics_tasks.rs` | `hardware_concurrency - 3` (≤4) workers parked on a futex semaphore. Box3D's `b3ParallelFor` enqueues solver tasks into a shared slot array; the pool (and the stepping thread itself) CAS-claim and execute them. Pure compute — no JS, no messages. |
 
 ### Data flow
@@ -191,61 +195,86 @@ runtime (the `wasm-bindgen-rayon` pattern — `packages/frontend/src/lib.rs`).
   render ──(PhysicsInit: BodyMotion + InputState addrs + collider list)──▶ main ──▶ physics
   physics ──(SpawnTaskWorkers)─▶ main ──(spawn ×N)─▶ task pool
   main ──(held keys / jumps)───────────────────▶ physics   ← InputState, shared mem
-  render ──(frame-tick, every presented frame)─▶ physics   ← BodyMotion, shared mem
+  main ──(camera, once per main frame)─────────▶ render    ← CameraRing, shared mem
+  render ──(frame time + tick, every frame)────▶ physics   ← BodyMotion, shared mem
   physics ══(solver tasks, inside every step)══▶ task pool ← TaskPool, shared mem futex
-  physics ──(PoseRing poses, every step)───────▶ render  ← shared mem, NO postMessage
+  physics ──(PoseRing poses + times, every step)▶ render ← shared mem, NO postMessage
   physics ──(AudioMsg: roll / wall-hit / land)─▶ main ──▶ WebAudio player
 ```
 
 Only the cold paths are `postMessage` (`packages/frontend/src/protocol.rs`); everything per-frame is
-**shared memory**. Physics publishes every fixed step's pose into a small
-**pose ring** per body (`PoseRing`, seqlock'd slots tagged with their step);
-the render thread samples the ring at its display time and writes the result
-into the renderer's transform arena. Keyboard input flows the same way — main
-writes held keys / jumps into an `InputState` block the physics worker polls —
-so input needs no `postMessage` either. No copy, no per-frame messaging.
+**shared memory**. Physics publishes every fixed step's pose, stamped with the
+time that step is due, into a small **pose ring** per body (`PoseRing`,
+seqlock'd slots tagged with their step); the render thread interpolates
+between the two steps around its display time and writes the result into the
+renderer's transform arena. Keyboard input flows the same way — main writes
+held keys / jumps into an `InputState` block the physics worker polls — and so
+does the camera (`CameraRing`, below). No copy, no per-frame messaging.
 
-**Why a fixed timestep + a pose-ring jitter buffer.** Physics steps a fixed
-`dt = 1/SIM_HZ` and catches up to elapsed real time with a bounded accumulator
-(multiple sub-steps per iteration, capped to avoid a spiral of death) — so the sim
-is correct and real-time regardless of step cost. The render thread **drives**
-the sim's cadence: it bumps a frame-tick after each presented frame and the
-physics worker blocks on it (`memory.atomic.wait`), so the two never beat
-against each other. But pacing alone isn't smoothness: measured on a loaded
-machine, physics legitimately publishes 3/4/5 steps per 60 Hz frame (honest
-frame-time wobble quantized against the 240 Hz grid). So the render thread
-runs a **display cursor**: it advances on the **vsync timestamp** (the rAF
-argument — never `performance.now()` inside the callback, which adds
-scheduling-delay noise), trails the newest published step by an **adaptive
-lag** (2 steps on a steady machine, growing to at most 24 when publishes
-arrive in bursts, then decaying back), and lerp/slerps between the ring's
-straddling poses. Wake wobble and bursts shift only how far the cursor
-trails — never the uniformity of what's displayed — and the ring
-(`POSE_RING` = 32 steps ≈ 133 ms) holds the worst-case lag with margin. The
-trail is the latency price (8.3 ms at the 2-step floor at 240 Hz; `SIM_HZ`
-is what keeps it small). Pose is published
-as position + quaternion (not a baked matrix) so the reader can `lerp`
+**Frame pacing: Fix Your Timestep, across two threads.** The standard loop
+([Fix Your Timestep](https://gafferongames.com/post/fix_your_timestep/),
+MainLoop.js) reads the clock once per frame, adds the elapsed time to an
+accumulator, runs as many fixed steps as it pays for, and draws
+`lerp(previous, current, accumulator / step)`. Here the steps and the drawing
+are on different threads, so that one clock reading has to travel:
+
+1. At the **start** of each frame, the render thread publishes the frame's
+   `requestAnimationFrame` timestamp `T` (absolute, `performance.timeOrigin +
+   t`, in wrapping µs — the threads have different time origins) and bumps a
+   frame tick. Starting the burst then, not after the frame's own work, gives
+   physics the whole frame period.
+2. The physics worker, blocked on that tick (`memory.atomic.wait`), adds
+   `T − T_prev` to its accumulator and runs as many fixed `1/SIM_HZ` steps as
+   that pays for (capped at 100 ms of catch-up, beyond which the backlog is
+   dropped and the world slows instead of spiralling). Every step's pose is
+   stamped with the time it is due, `T − accumulator`, computed from the f64
+   accumulator. Physics never reads its own clock for this: at wake-up it
+   would carry the render thread's CPU time and the futex wake latency, which
+   wobble from frame to frame and used to turn a steady 4 steps per 60 Hz
+   frame into 3/4/5.
+3. The next frame draws the world at `D = T − one step` — inside the pair of
+   steps that burst left, so it is exactly the textbook
+   `lerp(previous, current, alpha)`, one frame later because the burst ran
+   alongside the frame in between. `D` is fixed before the next burst starts,
+   so steps written meanwhile can't move what this frame shows. If the burst
+   isn't done in time, the newest step is older than `D`: the frame holds it
+   (no extrapolation) and counts as **app late** in the stats.
+
+Latency is therefore one frame plus at most one step (4.2 ms at 240 Hz), and
+it does not move. An earlier version instead let physics read its own clock
+and gave the renderer an adaptive "display cursor" (a lag of 2–24 steps
+behind the newest pose) to hide the resulting 3/4/5-step bursts; it varied
+the playback speed while correcting and kept extra latency for seconds after
+a hiccup. Two consequences of pipelining remain and are accepted: a dropped
+(or variable-refresh) frame shows as a stall followed by a double step,
+because frame `k + 1` shows the interval that ended at frame `k`; and while
+the tab is hidden, rAF stops, so the simulation pauses. Pose is published as
+position + quaternion (not a baked matrix) so the reader can `lerp`
 translation and `slerp` rotation correctly.
+
+**The camera: one frame of input per drawn frame.** The main thread owns
+the orbit camera (it has the pointer events): it applies every drag and wheel
+event, fans the yaw out to physics (camera-relative W/A/S/D) and the audio
+listener, and in its own `requestAnimationFrame` callback writes yaw / pitch /
+radius into a 4-slot `CameraRing`, stamped with that frame's time. Pointer
+input is delivered once per main-thread frame, but the render worker runs its
+own frame loop: reading "the latest camera" would race the two, and a render
+frame that starts just before main writes would see no movement while the
+next sees two frames' worth — the orbit judders 0/2. So the render worker
+takes the newest slot written at least half a frame before its own frame
+time: main's previous frame. That is exactly one frame of input per drawn
+frame, one frame of camera latency, and no race. The camera never goes
+through the fixed-step simulation, so it isn't interpolated either.
 
 **Forking note — interpolation vs extrapolation.** This template
 *interpolates* (displays slightly behind the newest step) because prediction
 overshoots on discontinuities, and this scene is all bounces. A twitch-genre
-fork may prefer *extrapolation* (zero display lag, occasional overshoot).
-The pose ring makes that a small, local change in `render_thread.rs`:
-
-- target the cursor at `latest + lead` instead of `latest - target_lag`, and
-- let `sample_ring` evaluate the newest pose pair with `alpha > 1`
-  (an unclamped lerp/slerp is already a first-order predictor).
-
-Two things to handle if you flip it: skip prediction across a
-`publish_snap` (teleports read as huge velocities for one frame), and for
-higher-quality prediction have physics publish velocity in each `PoseSlot`
-so extrapolation uses the solver's velocity instead of a finite difference.
-The trade is easiest to *see* at a low sim rate (e.g. `SIM_HZ = 60`):
-interpolation costs a visible 33 ms of lag, extrapolation visibly pokes the
-ball through the rail for a frame on hard bounces. At 240 Hz both artifacts
-shrink below ~12 ms — which is the deeper lesson: a high `SIM_HZ` is what
-makes the choice low-stakes.
+fork may prefer *extrapolation*: draw at the frame's own time instead of one
+frame back, and let `sample_at` evaluate the newest pose pair with
+`alpha > 1` (an unclamped lerp/slerp is already a first-order predictor).
+Skip prediction across a `publish_snap` (teleports read as huge velocities
+for one frame), and for better prediction have physics publish velocity in
+each `PoseSlot`. At 240 Hz the stakes are small either way.
 
 **One rate knob: `SIM_HZ`.** The step rate lives in a single `protocol::SIM_HZ`
 (default **240 Hz**), which both threads derive their timestep from. It's a genuine
@@ -253,8 +282,8 @@ one-number tuning knob because nothing else is written in "ticks": physical
 quantities (velocities, gravity, damping, `MOVE_ACCEL` as an acceleration) are
 `dt`-invariant, and the few tick counts (`ROLL_EVERY`, `IMPACT_COOLDOWN`,
 `MAX_SUBSTEPS`) are *derived* from `SIM_HZ`, so the feel is identical at any rate.
-Raising it lowers the display-latency floor (the cursor trails at least 2 steps: ≈8 ms at
-240, ≈33 ms at 60) and tightens collisions, for a linear CPU cost (~0.2 ms per
+Raising it lowers the interpolation part of the latency (at most one step: ≈4 ms at
+240, ≈17 ms at 60) and tightens collisions, for a linear CPU cost (~0.2 ms per
 step here). The rule when extending: **express any new per-step force per second
 and multiply by the step `dt`** — never bake the rate into a constant.
 
@@ -344,6 +373,9 @@ second and in total: the render thread adds up the time between its presented
 frames (`BodyMotion::frame_span_us`), and a span of `S` ms at refresh period
 `P` should hold `S / P` frames. A nonzero rate means the renderer is not
 keeping up with the display; lower the resolution or the anti-aliasing.
+**app late** counts frames drawn before physics had finished the burst they
+show (each repeats the previous picture of the world); it turns red when it
+persists for three seconds, meaning the physics thread can't keep up.
 
 ## The threaded build profile (why it's different)
 

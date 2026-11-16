@@ -7,12 +7,15 @@
 //! fetch it same-origin, deserialize with `scene_from_toml`, and materialize it
 //! with [`load_scene_for_player`]. The scene's own colliders become the physics
 //! world (table + walls static, ball dynamic — see [`derive_physics`]). Physics
-//! publishes the ball's prev/curr fixed-step pose into a shared
-//! [`BodyMotion`](crate::protocol::BodyMotion) buffer; each render frame we read
-//! it, **interpolate** prev→curr by an alpha from our own clock, and write the
-//! resulting matrix into the renderer's transform arena — so motion stays smooth
-//! regardless of the fixed sim rate, with no per-frame messaging. Lighting is
-//! entirely the scene's (the loader instantiates its light nodes).
+//! publishes every fixed step's pose, stamped with the time it is due, into a
+//! shared [`BodyMotion`](crate::protocol::BodyMotion) ring. Each frame starts by
+//! publishing the frame's time (which paces physics), then draws the world at
+//! the previous frame's time minus one step, **interpolated** between the two
+//! published steps around it — Fix Your Timestep's `lerp(previous, current,
+//! alpha)`, one frame behind because physics runs on its own thread (see the
+//! `protocol` module docs). The camera comes from main through shared memory
+//! too ([`CameraRing`]). No per-frame messaging. Lighting is entirely the
+//! scene's (the loader instantiates its light nodes).
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -24,8 +27,9 @@ use wasm_bindgen::JsCast;
 use web_sys::js_sys;
 
 use crate::protocol::{
-    BallMotions, BodyMotion, CameraMsg, ColliderInit, ColliderShapeMsg, DropMsg, PhysicsInit,
-    QualityMsg, RenderMsg, ResizeMsg, POSE_RING, ROLE_FLOOR, SIM_HZ,
+    abs_time_us, time_diff_us, BallMotions, BodyMotion, Bracket, CameraRing, ColliderInit,
+    ColliderShapeMsg, DropMsg, OrbitCamera, PhysicsInit, PoseRing, QualityMsg, RenderMsg,
+    ResizeMsg, ROLE_FLOOR, STEP_US,
 };
 
 /// The boxed RAF callback, self-referenced so the render loop can reschedule
@@ -37,65 +41,32 @@ use crate::protocol::{
 /// that delay straight into displayed positions as judder.
 type RafCell = Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>>;
 
-/// Sample a body's [`PoseRing`] at fractional step `display_step`:
-/// lerp/slerp between the straddling steps. Falls back to the ring's latest
-/// pose when the wanted steps aren't in the ring (ball created after the
-/// cursor's window, extreme stall) — a one-frame anchor, never garbage.
-fn sample_ring(ring: &crate::protocol::PoseRing, display_step: f64) -> (Vec3, Quat) {
-    let base = display_step.floor().max(0.0) as u32;
-    let alpha = (display_step - display_step.floor()) as f32;
-    if let (Some((p0, q0)), Some((p1, q1))) = (ring.read_step(base), ring.read_step(base + 1)) {
-        return (
-            Vec3::from_array(p0).lerp(Vec3::from_array(p1), alpha),
-            Quat::from_array(q0).slerp(Quat::from_array(q1), alpha),
-        );
-    }
-    // The exact pair isn't available (cursor at the very newest step, a ball
-    // younger than the cursor, or a stall evicted it) — hold the newest pose.
-    let (p, q) = ring.read_latest();
-    (Vec3::from_array(p), Quat::from_array(q))
-}
-
-/// Once-per-second sync telemetry (debug level): the distribution of physics
-/// steps published per render frame, and the band of the display cursor's
-/// re-anchor error (in steps; how far the cursor sat from `latest -
-/// TARGET_LAG` before correction). The steps/frame wobble (`3:`/`5:` buckets
-/// flanking `4:`) is EXPECTED — the pose-ring jitter buffer absorbs it; what
-/// matters for smoothness is the err band staying well inside ±TARGET_LAG.
-#[derive(Default)]
-struct SyncStats {
-    /// Buckets 0..=9 steps; index 10 counts anything higher.
-    buckets: [u32; 11],
-    err_min: f32,
-    err_max: f32,
-    frames: u32,
-}
-
-impl SyncStats {
-    fn record(&mut self, steps: u32, err: f32) {
-        self.buckets[(steps as usize).min(10)] += 1;
-        if self.frames == 0 {
-            (self.err_min, self.err_max) = (err, err);
-        } else {
-            self.err_min = self.err_min.min(err);
-            self.err_max = self.err_max.max(err);
+/// A body's pose at display time `display_us` (see [`PoseRing::bracket`]):
+/// lerp/slerp between the two published steps around it. Also says whether
+/// physics was late — its newest step older than the display time — in which
+/// case the newest pose is held (never extrapolated). With no display time
+/// yet (the first frame) the newest pose is used.
+fn sample_at(ring: &PoseRing, display_us: Option<u32>) -> (Vec3, Quat, bool) {
+    let pose = |p: crate::protocol::StepPose| (Vec3::from_array(p.pos), Quat::from_array(p.quat));
+    let Some(display_us) = display_us else {
+        let (p, q) = pose(ring.read_latest());
+        return (p, q, false);
+    };
+    match ring.bracket(display_us) {
+        Bracket::Between { older, newer } => {
+            let span = time_diff_us(newer.time_us, older.time_us).max(1) as f32;
+            let alpha = (time_diff_us(display_us, older.time_us) as f32 / span).clamp(0.0, 1.0);
+            let (p0, q0) = pose(older);
+            let (p1, q1) = pose(newer);
+            (p0.lerp(p1, alpha), q0.slerp(q1, alpha), false)
         }
-        self.frames += 1;
-        if self.frames >= 60 {
-            let mut hist = String::new();
-            for (steps, count) in self.buckets.iter().enumerate() {
-                if *count > 0 {
-                    use std::fmt::Write;
-                    let _ = write!(hist, "{steps}:{count} ");
-                }
-            }
-            tracing::debug!(
-                "sync: steps/frame [{}] cursor err {:.2}..{:.2}",
-                hist.trim_end(),
-                self.err_min,
-                self.err_max
-            );
-            *self = SyncStats::default();
+        Bracket::Late(newest) => {
+            let (p, q) = pose(newest);
+            (p, q, true)
+        }
+        Bracket::Early(oldest) => {
+            let (p, q) = pose(oldest);
+            (p, q, false)
         }
     }
 }
@@ -110,63 +81,6 @@ const PLAYER_TINT: [f32; 4] = [1.0, 0.25, 0.2, 1.0];
 const CAMERA_FOV_Y_DEG: f32 = 55.0;
 const CAMERA_NEAR: f32 = 0.1;
 const CAMERA_FAR: f32 = 400.0;
-
-/// A minimal mouse-driven orbit camera (after the renderer's `model-tests`
-/// `OrbitCamera`): it circles a fixed `look_at` point at spherical
-/// `(yaw, pitch, radius)`. Right-drag to orbit, wheel to dolly (no pan — the
-/// table can never leave the frame). State lives on the render thread; the main
-/// thread feeds it gesture deltas via [`CameraMsg`], and separately integrates
-/// the SAME yaw (see [`crate::protocol::CAMERA_ORBIT_SENSITIVITY`]) to keep
-/// W/A/S/D rolling and the audio listener camera-relative.
-struct OrbitCamera {
-    look_at: glam::Vec3,
-    radius: f32,
-    yaw: f32,
-    pitch: f32,
-}
-
-impl OrbitCamera {
-    const SENSITIVITY: f32 = crate::protocol::CAMERA_ORBIT_SENSITIVITY;
-    /// Just under 90° so the camera never flips over the pole.
-    const PITCH_MAX: f32 = std::f32::consts::FRAC_PI_2 - 0.01;
-    /// Floor keeps the eye above the table rim — never under the felt, and the
-    /// playfield stays readable even at the shallowest angle.
-    const PITCH_MIN: f32 = 0.15;
-    const MIN_RADIUS: f32 = 2.0;
-    const MAX_RADIUS: f32 = 25.0;
-
-    fn new(look_at: glam::Vec3, radius: f32, yaw: f32, pitch: f32) -> Self {
-        Self {
-            look_at,
-            radius,
-            yaw,
-            pitch,
-        }
-    }
-
-    /// Apply a drag delta (CSS pixels): horizontal → yaw, vertical → pitch.
-    fn orbit(&mut self, dx: f32, dy: f32) {
-        self.yaw -= dx * Self::SENSITIVITY;
-        self.pitch = (self.pitch - dy * Self::SENSITIVITY).clamp(Self::PITCH_MIN, Self::PITCH_MAX);
-    }
-
-    /// Apply a wheel delta — positive `dy` (scroll down) dollies out.
-    fn zoom(&mut self, dy: f32) {
-        self.radius = (self.radius * (1.0 + dy * 0.001)).clamp(Self::MIN_RADIUS, Self::MAX_RADIUS);
-    }
-
-    /// Camera world position from spherical coords (yaw 0 = looking from +Z).
-    fn eye(&self) -> glam::Vec3 {
-        let (sy, cy) = self.yaw.sin_cos();
-        let (sp, cp) = self.pitch.sin_cos();
-        self.look_at
-            + glam::Vec3::new(
-                self.radius * cp * sy,
-                self.radius * sp,
-                self.radius * cp * cy,
-            )
-    }
-}
 
 /// Worker entry: unpack the transferred `OffscreenCanvas` + page origin, build
 /// the WebGPU device, and kick off the async load+render.
@@ -219,6 +133,15 @@ pub fn start(payload: JsValue) -> Result<(), JsValue> {
             .unwrap_or(false)
     };
     let desired_aa = (get_bool("msaa"), get_bool("smaa"));
+    // The camera ring main writes (see `CameraRing`): leaked by main in the
+    // same `WebAssembly.Memory`, so its address is valid here.
+    let camera_ptr = js_sys::Reflect::get(&payload, &JsValue::from_str("camera_ptr"))
+        .ok()
+        .and_then(|v| v.as_f64())
+        .filter(|p| *p > 0.0)
+        .ok_or_else(|| JsValue::from_str("render worker: no camera_ptr"))?;
+    // SAFETY: see above — a live, never-freed `CameraRing`.
+    let camera_ring: &'static CameraRing = unsafe { &*(camera_ptr as usize as *const CameraRing) };
     let canvas_handle = canvas.clone();
     post_progress("render worker: requesting WebGPU device…");
     let gpu =
@@ -227,7 +150,7 @@ pub fn start(payload: JsValue) -> Result<(), JsValue> {
         .with_device_request_limits(DeviceRequestLimits::max_all());
 
     wasm_bindgen_futures::spawn_local(async move {
-        if let Err(err) = run(gpu_builder, canvas_handle, origin, desired_aa).await {
+        if let Err(err) = run(gpu_builder, canvas_handle, origin, desired_aa, camera_ring).await {
             tracing::error!("render thread: {err:?}");
             post_to_main(&RenderMsg::Error {
                 message: format!("{err:?}"),
@@ -242,6 +165,7 @@ async fn run(
     canvas: web_sys::OffscreenCanvas,
     origin: String,
     desired_aa: (bool, bool),
+    camera_ring: &'static CameraRing,
 ) -> Result<(), JsValue> {
     use awsm_renderer::camera::CameraParams;
     use awsm_renderer::AwsmRendererBuilder;
@@ -494,17 +418,14 @@ async fn run(
     post_progress("starting render loop; spawning physics…");
 
     // ── Render loop: orbit camera + interpolated ball ───────────────────────
-    // The camera circles the play area; the main thread feeds it drag/wheel
-    // deltas (it owns the DOM), which we apply here via `CameraMsg`. Initial
-    // framing: head-on from +Z, tilted ~26° down, looking just above the table.
-    let center = Vec3::new(0.0, 0.4, 0.0);
+    // Main owns the camera (it has the pointer events) and writes it into the
+    // shared `CameraRing` once per main-thread frame; each frame we copy one
+    // slot of it into this, the camera we draw and unproject clicks with.
     #[allow(clippy::arc_with_non_send_sync)]
-    let camera = Rc::new(RefCell::new(OrbitCamera::new(center, 9.0, 0.0, 0.46)));
+    let camera = Rc::new(RefCell::new(OrbitCamera::start()));
     // The onmessage handler handles [`DropMsg`] (click → unproject onto the
-    // table → drop request) and the orbit/zoom `CameraMsg`s. Controls and
-    // audio stay coherent while the camera moves because main mirrors the
-    // camera yaw to physics (camera-relative W/A/S/D) and to the audio
-    // listener (see `audio.rs`).
+    // table through the camera last drawn → drop request), resizes and
+    // anti-aliasing changes.
     // Runtime anti-aliasing: main posts a `QualityMsg` on a Settings toggle;
     // the input handler drops the requested (msaa, smaa) here, and the render
     // loop applies it off the render path (see the RAF closure). `reconfiguring`
@@ -533,49 +454,13 @@ async fn run(
     let cell_loop = cell.clone();
     let camera_loop = camera.clone();
 
-    // Interpolation state, carried across frames by the FnMut closure.
-    // Derived from the shared `SIM_HZ` so it always matches the physics step.
-    const FIXED_DT: f32 = (1.0 / SIM_HZ) as f32;
-    // ── Display cursor: WHICH sim time this frame shows, in steps ───────────
-    // The cursor advances on the render clock and trails the newest published
-    // step by an ADAPTIVE lag; poses come from the shared pose ring at
-    // cursor⌊⌋/cursor⌈⌉ (see `PoseRing`). This is a jitter buffer: physics
-    // wake wobble/bursts don't move the cursor, they only wiggle how far
-    // behind `latest` it trails — the sampled motion stays uniform as long as
-    // the wobble fits inside the lag. The lag is the display-latency price
-    // (in steps: 2 = 8.3 ms at 240 Hz), so it FOLLOWS the observed wobble
-    // envelope instead of being fixed: a desktop's ±1–2-step wobble keeps it
-    // at the minimum, while a phone — where thread contention delays the
-    // physics wake and the accumulator then catches up in a 6–12-step burst —
-    // floats up until the bursts fit (the alternative is the cursor ramming
-    // its rails: motion visibly pulses, like the ball is re-pushed). The
-    // envelope is a decaying peak, so a rough patch stops costing latency
-    // once it passes. REANCHOR_GAIN only sets how fast residual clock drift
-    // re-centers (~0.3 s time constant); correctness does not depend on it.
-    /// Lag floor — routine desktop wobble fits inside this.
-    const TARGET_LAG_MIN: f64 = 2.0;
-    /// Lag ceiling (100 ms at 240 Hz) — must stay well inside [`POSE_RING`],
-    /// and past this smoothness stops being worth the added latency.
-    const TARGET_LAG_MAX: f64 = 24.0;
-    /// Per-frame decay of the wobble peak (halves in ~5 s at 60 fps).
-    const WOBBLE_DECAY: f64 = 0.9977;
-    const REANCHOR_GAIN: f64 = 0.05;
-    let mut display_step: f64 = 0.0;
-    let mut target_lag: f64 = TARGET_LAG_MIN;
-    let mut wobble: f64 = 0.0;
-    let mut last_step: u32 = 0;
-    // The previous frame's VSYNC timestamp (the rAF argument) — `None` until
-    // the first frame. See `RafCell`: frame time must come from the vsync
-    // grid, not from when the callback happened to run.
-    let mut last_vsync: Option<f64> = None;
+    // The previous frame's time (`abs_time_us` of its rAF timestamp), which
+    // this frame draws at, minus one step — `None` on the first frame. See
+    // the `protocol` module docs.
+    let mut last_frame_us: Option<u32> = None;
     // The previous PRESENTED frame's vsync timestamp, for the stats panel's
     // missed-frame count (`BodyMotion::add_frame_span_us`).
     let mut last_presented: Option<f64> = None;
-    // Low-passed re-anchor error: `latest` carries the wake wobble, and
-    // applying the raw error each frame would leak 5% of that wobble into the
-    // display. The drift this corrects is DC; smooth the noise away first.
-    let mut err_ema: f64 = 0.0;
-    let mut sync_stats = SyncStats::default();
     let mut frame_count: u32 = 0;
     // Last GPU-timing sample count published to the stats panel.
     let mut gpu_samples_seen: u64 = 0;
@@ -589,6 +474,9 @@ async fn run(
         .ok()
         .and_then(|p| p.dyn_into::<web_sys::Performance>().ok())
         .ok_or_else(|| JsValue::from_str("render: no performance.now"))?;
+    // Frame times cross threads, so they are absolute (each worker has its
+    // own `timeOrigin`).
+    let time_origin = perf.time_origin();
 
     *raf_init.borrow_mut() = Some(Closure::new(move |vsync_ms: f64| {
         // An async anti-aliasing reconfig has taken the renderer out of the cell
@@ -676,40 +564,41 @@ async fn run(
             return;
         };
 
-        // Advance the display cursor on the VSYNC clock, then gently trail
-        // the newest published step (see the cursor's declaration comment).
-        // The hard clamp only fires on genuine discontinuities (tab hidden,
-        // physics stall) — it snaps the cursor back inside the ring's window.
-        let dt = match last_vsync {
-            Some(prev) => (((vsync_ms - prev) / 1000.0) as f32).clamp(0.0, 0.1),
-            None => 0.0,
-        };
-        last_vsync = Some(vsync_ms);
-        let latest = motion.latest_step();
-        let steps_this_frame = latest.wrapping_sub(last_step);
-        last_step = latest;
-        display_step += (dt / FIXED_DT) as f64;
-        let err = (latest as f64 - target_lag) - display_step;
-        // Adapt the lag to the observed wobble envelope (see the cursor's
-        // declaration comment). Errors beyond the ring are discontinuities
-        // (tab hidden, physics stall) — the hard clamp below handles those;
-        // they are not jitter and must not inflate the lag.
-        if err.abs() < POSE_RING as f64 {
-            wobble = (wobble * WOBBLE_DECAY).max(err.abs());
-            target_lag = (TARGET_LAG_MIN + wobble).clamp(TARGET_LAG_MIN, TARGET_LAG_MAX);
+        // ── Frame start: publish this frame's time, waking physics ──────────
+        // The rAF argument is the frame's VSYNC-aligned time (see `RafCell`).
+        let frame_us = abs_time_us(time_origin, vsync_ms);
+        // What this frame shows: the world at the PREVIOUS frame's time minus
+        // one step — inside the pair of steps that frame's burst left (Fix
+        // Your Timestep's lerp by alpha), decided before the new burst starts.
+        let display_us = last_frame_us.map(|t| t.wrapping_sub(STEP_US));
+        // The camera main wrote at least half a frame ago: its previous
+        // frame's (see `CameraRing`).
+        let camera_cutoff_us =
+            last_frame_us.map(|t| t.wrapping_add((time_diff_us(frame_us, t).max(0) / 2) as u32));
+        last_frame_us = Some(frame_us);
+        // The span since the previous presented frame, for the missed-frame
+        // count — added before the tick, so a reader that sees this frame's
+        // tick also sees its span.
+        if let Some(prev) = last_presented.replace(vsync_ms) {
+            motion.add_frame_span_us(((vsync_ms - prev) * 1000.0).round().max(0.0) as u64 as u32);
         }
-        err_ema += (err - err_ema) * 0.1;
-        display_step += err_ema * REANCHOR_GAIN;
-        display_step = display_step.clamp(
-            (latest as f64 - (POSE_RING as f64 - 2.0)).max(0.0),
-            latest as f64,
-        );
-        sync_stats.record(steps_this_frame, err as f32);
-        // Publish sync health + the current lag for the stats panel.
-        motion.note_sync_err(err.abs() as f32);
-        motion.set_display_lag(target_lag as f32);
+        // Physics now has the whole frame period to simulate up to
+        // `frame_us`; the next frame draws the result.
+        motion.begin_frame(frame_us);
 
-        let (pos, rot) = sample_ring(motion.ring(), display_step);
+        if let Some(cutoff) = camera_cutoff_us {
+            if let Some((yaw, pitch, radius)) = camera_ring.read_at(cutoff) {
+                let mut cam = camera_loop.borrow_mut();
+                cam.yaw = yaw;
+                cam.pitch = pitch;
+                cam.radius = radius;
+            }
+        }
+
+        let (pos, rot, late) = sample_at(motion.ring(), display_us);
+        if late {
+            motion.note_app_late();
+        }
         // Bake the ball mesh's authored scale in (the arena slot is the absolute
         // world matrix). This thread is the sole writer of this slot.
         let mat = Mat4::from_scale_rotation_translation(Vec3::splat(ball_visual_scale), rot, pos);
@@ -728,7 +617,8 @@ async fn run(
         // slot with the same alpha (all bodies advance in the same steps).
         let ball_count = balls.count();
         while ball_bindings.len() < ball_count {
-            let (cp, cq) = balls.slot(ball_bindings.len()).read_latest();
+            let newest = balls.slot(ball_bindings.len()).read_latest();
+            let (cp, cq) = (newest.pos, newest.quat);
             let tk = r.transforms.insert(
                 awsm_renderer::transforms::Transform {
                     translation: Vec3::from_array(cp),
@@ -759,9 +649,9 @@ async fn run(
             }
         }
         for (slot_index, b) in ball_bindings.iter().enumerate() {
-            // Same display cursor as the player — every body advances in the
+            // Same display time as the player — every body advances in the
             // same fixed steps.
-            let (pos, rot) = sample_ring(balls.slot(slot_index), display_step);
+            let (pos, rot, _) = sample_at(balls.slot(slot_index), display_us);
             let mat =
                 Mat4::from_scale_rotation_translation(Vec3::splat(ball_visual_scale), rot, pos);
             let cols = mat.to_cols_array();
@@ -803,15 +693,6 @@ async fn run(
             }
         }
 
-        // The span since the previous presented frame, for the missed-frame
-        // count — added before the tick, so a reader that sees this frame's
-        // tick also sees its span.
-        if let Some(prev) = last_presented.replace(vsync_ms) {
-            motion.add_frame_span_us(((vsync_ms - prev) * 1000.0).round().max(0.0) as u64 as u32);
-        }
-        // Frame presented — wake physics to advance the sim for the next one, so
-        // its step cadence stays locked to vsync (see `BodyMotion::bump_frame`).
-        motion.bump_frame();
         // Publish this frame's CPU cost (µs) for the stats panel's ms/frame.
         motion.add_frame_work_us(((perf.now() - work_t0) * 1000.0).max(0.0) as u32);
 
@@ -1027,9 +908,10 @@ fn aspect(canvas: &web_sys::OffscreenCanvas) -> f32 {
     (canvas.width().max(1) as f32) / (canvas.height().max(1) as f32)
 }
 
-/// Install this worker's `onmessage`: [`DropMsg`] clicks (always) and
-/// [`CameraMsg`] gestures (only when the camera isn't locked). Overrides the
-/// bootstrap's init handler, which has already done its job by now.
+/// Install this worker's `onmessage`: [`DropMsg`] clicks, canvas resizes and
+/// anti-aliasing changes. Overrides the bootstrap's init handler, which has
+/// already done its job by now. (The camera does not come through here: see
+/// [`CameraRing`].)
 ///
 /// A click becomes a ball: unproject the NDC point through the current camera
 /// onto the tabletop plane, clamp it to the table interior (inside the rails),
@@ -1105,12 +987,6 @@ fn install_render_input(
                 floor_tr[2] + floor_he[2] - margin,
             );
             balls.request_drop(x, z);
-            return;
-        }
-        match serde_wasm_bindgen::from_value::<CameraMsg>(e.data()) {
-            Ok(CameraMsg::Orbit { dx, dy }) => camera.borrow_mut().orbit(dx, dy),
-            Ok(CameraMsg::Zoom { dy }) => camera.borrow_mut().zoom(dy),
-            Err(_) => { /* not a CameraMsg — ignore */ }
         }
     });
     scope.set_onmessage(Some(cb.as_ref().unchecked_ref()));

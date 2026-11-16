@@ -178,17 +178,19 @@ Box3D's contact solver is built around 4-wide float SIMD (`b3V32` in
 
 ## Sync & fluidity
 
-The pose-ring jitter buffer + vsync-timestamp display cursor are documented in
-the README ("The threads"). Reference points for future debugging:
+Frame pacing (one clock, per-step due times, `lerp` at `T − one step`) and the
+camera ring are documented in the README ("The threads"). Reference points for
+future debugging:
 
-- Physics honestly publishes 3/4/5 steps per 60 Hz frame (frame wobble
-  quantized against the 240 Hz grid) — a 1-step interpolation window can't
-  absorb it; the 32-step ring + adaptive trailing cursor (2-step floor) does.
+- Physics steps to the render thread's published frame time, never to its own
+  clock at wake-up — that clock carries render CPU time + futex wake latency
+  and turned a steady 4 steps per 60 Hz frame into 3/4/5.
 - Frame time must come from the rAF `DOMHighResTimeStamp` argument, never
   `performance.now()` inside the callback (scheduling delay becomes judder).
-- 1 Hz `sync:` debug telemetry (steps/frame histogram + cursor-err band) in
-  `render_thread.rs` is the canonical smoothness diagnostic; cursor err should
-  sit well inside ±2 steps.
+- Step due times are `T − accumulator` from the f64 accumulator; a running
+  `+ 4167 µs` would drift ~80 µs/s against the display time.
+- The stats panel's **app late** line is the smoothness diagnostic: it should
+  sit at 0 on a desktop; **missed** says whether the renderer itself keeps up.
 - **Judder discriminator**: inject a pure rAF-driven DOM square (devtools
   console) next to the canvas — if it hitches at the same moments as the
   ball, the judder is compositor frame skips (the platform floor), not the

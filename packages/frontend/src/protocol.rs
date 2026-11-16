@@ -1,20 +1,40 @@
 //! The typed messages — and shared-memory blocks — that cross the three threads.
 //!
 //! Only the cold paths are `postMessage` (serialized with `serde` +
-//! `serde_wasm_bindgen`). The two *hot* paths are shared memory instead: per-frame
-//! ball motion + the render→physics frame-tick live in [`BodyMotion`] (physics
-//! publishes prev/curr poses, render reads/interpolates and ticks back), and
-//! keyboard input lives in [`InputState`] (main writes, physics polls). See
-//! [`crate::physics_thread`].
+//! `serde_wasm_bindgen`). The hot paths are shared memory instead: per-step
+//! ball poses + the render→physics frame tick and frame time live in
+//! [`BodyMotion`] (physics publishes every step's pose with its simulation
+//! time, render interpolates and ticks back), keyboard input lives in
+//! [`InputState`] (main writes, physics polls), and the camera lives in
+//! [`CameraRing`] (main writes once per main-thread frame, render reads once
+//! per render frame). See [`crate::physics_thread`].
 //!
 //! ```text
 //!   main ──(spawn, OffscreenCanvas)──▶ render        [RenderMsg back to main]
 //!   render ──(PhysicsInit, via main)─▶ physics
 //!   main ──(held keys / jumps)──▶ physics            (InputState, shared memory)
-//!   physics ◀──(frame-tick)── render                 (BodyMotion, shared memory)
-//!   physics ──(prev/curr pose, every step)──▶ render (BodyMotion, NOT a message)
+//!   main ──(yaw/pitch/radius per frame)──▶ render    (CameraRing, shared memory)
+//!   physics ◀──(frame tick + frame time)── render    (BodyMotion, shared memory)
+//!   physics ──(pose + sim time, every step)──▶ render (BodyMotion, NOT a message)
 //!   physics ──(AudioMsg)──▶ main                     (gameplay sound cues)
 //! ```
+//!
+//! ## One clock: Fix Your Timestep across two threads
+//!
+//! The render thread's `requestAnimationFrame` timestamp is the only clock
+//! that paces the simulation. At the START of each frame, render publishes
+//! that timestamp `T_k` (absolute: `performance.timeOrigin + rAF time`, as
+//! wrapping microseconds) and bumps the frame tick. Physics wakes, adds
+//! `T_k − T_(k−1)` to its fixed-step accumulator, runs as many whole steps as
+//! that pays for, and stamps every step's pose with the time it is due:
+//! `T_k − accumulator` (computed from the f64 accumulator, never by adding a
+//! rounded step length). Render, in frame `k+1`, draws at display time
+//! `D = T_k − STEP` and interpolates between the two published steps around
+//! it, which is exactly Fix Your Timestep's `lerp(previous, current,
+//! accumulator / STEP)` — one frame later, because the burst runs on its own
+//! thread while frame `k` draws. If the burst has not finished in time, the
+//! newest step is older than `D`: render holds it (no extrapolation) and
+//! counts the frame as "app late".
 
 use core::arch::wasm32::{memory_atomic_notify, memory_atomic_wait32};
 use core::sync::atomic::{fence, AtomicU32, Ordering};
@@ -59,6 +79,25 @@ use serde::{Deserialize, Serialize};
 /// express it per second and multiply by the step `dt`** — don't bake the rate
 /// into a constant, or you'll reintroduce the very coupling this removes.
 pub const SIM_HZ: f64 = 240.0;
+
+/// One fixed step in microseconds, rounded up: render's display time is
+/// `T − STEP_US`. (The exact length is `1e6 / SIM_HZ`; rounding up keeps the
+/// display time at or before the newest step a finished burst publishes.)
+pub const STEP_US: u32 = (1_000_000.0 / SIM_HZ + 0.999) as u32;
+
+/// An absolute time (`performance.timeOrigin + t_ms`, in milliseconds since
+/// the epoch) as wrapping microseconds. Every worker has its own
+/// `timeOrigin`, so times that cross threads are absolute; u32 µs wraps every
+/// ~71 minutes, so compare them only with [`time_diff_us`].
+pub fn abs_time_us(time_origin_ms: f64, t_ms: f64) -> u32 {
+    ((time_origin_ms + t_ms) * 1000.0) as u64 as u32
+}
+
+/// `a − b` in microseconds for two wrapping [`abs_time_us`] times that are
+/// within ±35 minutes of each other.
+pub fn time_diff_us(a: u32, b: u32) -> i32 {
+    a.wrapping_sub(b) as i32
+}
 
 /// Everything the physics thread needs to start driving the scene's ball. The
 /// render thread owns the renderer (hence the shared transform arena) *and*
@@ -171,24 +210,48 @@ impl Default for BallMotions {
     }
 }
 
-/// Pose-ring depth, in steps (~133 ms of history at 240 Hz). The ring is a
-/// **jitter buffer**: the render thread samples it at its own display time, so
-/// any wobble or burstiness in when physics wakes and publishes — up to this
-/// many steps — is absorbed by *data*, not clamped by an interpolation window.
-/// Measured wobble is ±1–2 steps on a loaded desktop but 6–12 steps on
-/// phones (thread contention delays the physics wake, then the accumulator
-/// catches up in a burst), and the render thread's display lag adapts to
-/// that envelope — so the ring must hold the worst adaptive lag plus margin;
-/// only genuine hiccups (tab hidden, physics stall) fall off the end.
+/// Pose-ring depth, in steps (~133 ms of history at 240 Hz). Render only
+/// ever reads the two steps around its display time, at most one burst behind
+/// the newest; the ring is deep enough that a whole burst (up to
+/// `MAX_SUBSTEPS`, see `physics_thread`) can be written while render reads
+/// the pair the previous burst left — the seqlock and step tag catch
+/// anything else.
 pub const POSE_RING: usize = 32;
 
+/// One step's published pose, as read back: where the body was, and the
+/// absolute time ([`abs_time_us`]) that step is due.
+#[derive(Debug, Clone, Copy)]
+pub struct StepPose {
+    pub step: u32,
+    pub time_us: u32,
+    pub pos: [f32; 3],
+    pub quat: [f32; 4],
+}
+
+/// Where a display time falls in a body's published steps (see
+/// [`PoseRing::bracket`]).
+#[derive(Debug, Clone, Copy)]
+pub enum Bracket {
+    /// `older.time_us <= D < newer.time_us`: interpolate.
+    Between { older: StepPose, newer: StepPose },
+    /// The newest published step is before `D`: physics has not finished
+    /// the burst this frame shows. Hold it (no extrapolation).
+    Late(StepPose),
+    /// Nothing in the ring is old enough (a body younger than `D`, or the
+    /// startup seed): hold the oldest available step.
+    Early(StepPose),
+}
+
 /// One fixed step's published pose, seqlock'd, tagged with its absolute step
-/// index so a reader can tell whether the slot still holds the step it wants
-/// (the ring overwrites in place).
+/// index (so a reader can tell whether the slot still holds the step it
+/// wants — the ring overwrites in place) and the time the step is due.
 #[repr(C)]
 pub struct PoseSlot {
     version: AtomicU32,
     step: AtomicU32,
+    /// When this step is due, as [`abs_time_us`]: `T − accumulator` for the
+    /// frame time `T` whose burst produced it.
+    time_us: AtomicU32,
     /// `pos[3], quat[4]` as f32 bit patterns.
     fields: [AtomicU32; 7],
 }
@@ -198,15 +261,17 @@ impl PoseSlot {
         PoseSlot {
             version: AtomicU32::new(0),
             step: AtomicU32::new(u32::MAX),
+            time_us: AtomicU32::new(0),
             fields: core::array::from_fn(|_| AtomicU32::new(0)),
         }
     }
 
-    fn write(&self, step: u32, pos: [f32; 3], quat: [f32; 4]) {
+    fn write(&self, step: u32, time_us: u32, pos: [f32; 3], quat: [f32; 4]) {
         let v = self.version.load(Ordering::Relaxed);
         self.version.store(v.wrapping_add(1), Ordering::Relaxed); // odd: in flight
         fence(Ordering::Release);
         self.step.store(step, Ordering::Relaxed);
+        self.time_us.store(time_us, Ordering::Relaxed);
         let vals = [pos[0], pos[1], pos[2], quat[0], quat[1], quat[2], quat[3]];
         for (slot, val) in self.fields.iter().zip(vals) {
             slot.store(val.to_bits(), Ordering::Relaxed);
@@ -217,7 +282,7 @@ impl PoseSlot {
 
     /// Untorn read, `None` if the slot holds a different step (overwritten) or
     /// a write is racing.
-    fn read(&self, expect_step: u32) -> Option<([f32; 3], [f32; 4])> {
+    fn read(&self, expect_step: u32) -> Option<StepPose> {
         for _ in 0..64 {
             let v1 = self.version.load(Ordering::Relaxed);
             if v1 & 1 != 0 {
@@ -226,6 +291,7 @@ impl PoseSlot {
             }
             fence(Ordering::Acquire);
             let step = self.step.load(Ordering::Relaxed);
+            let time_us = self.time_us.load(Ordering::Relaxed);
             let mut f = [0.0_f32; 7];
             for (i, slot) in self.fields.iter().enumerate() {
                 f[i] = f32::from_bits(slot.load(Ordering::Relaxed));
@@ -235,7 +301,12 @@ impl PoseSlot {
                 if step != expect_step {
                     return None;
                 }
-                return Some(([f[0], f[1], f[2]], [f[3], f[4], f[5], f[6]]));
+                return Some(StepPose {
+                    step,
+                    time_us,
+                    pos: [f[0], f[1], f[2]],
+                    quat: [f[3], f[4], f[5], f[6]],
+                });
             }
         }
         None
@@ -244,11 +315,8 @@ impl PoseSlot {
 
 /// A ring of the last [`POSE_RING`] published step poses for one body, plus
 /// the latest published step index. Physics (sole writer) publishes every
-/// fixed step; render samples the ring at a step-indexed display time (see
-/// `render_thread`'s display cursor). Replaces the earlier prev/curr
-/// double-buffer, whose one-step interpolation window could not absorb the
-/// real ±1–2 step wobble between the two threads' clocks — the display rammed
-/// the window's rails and juddered.
+/// fixed step with its due time; render finds the two steps around its
+/// display time ([`Self::bracket`]) and interpolates between them.
 #[repr(C)]
 pub struct PoseRing {
     latest: AtomicU32,
@@ -262,26 +330,38 @@ impl PoseRing {
             latest: AtomicU32::new(0),
             slots: core::array::from_fn(|_| PoseSlot::new()),
         };
-        ring.slots[0].write(0, pos, quat);
+        // Step 0 is the startup seed: it has no real time, and `bracket`
+        // treats it as such.
+        ring.slots[0].write(0, 0, pos, quat);
         ring
     }
 
-    /// Writer side (physics): publish the pose at absolute step `step`.
-    pub fn publish(&self, step: u32, pos: [f32; 3], quat: [f32; 4]) {
-        self.slots[step as usize % POSE_RING].write(step, pos, quat);
+    /// Writer side (physics): publish the pose at absolute step `step`, due
+    /// at `time_us`.
+    pub fn publish(&self, step: u32, time_us: u32, pos: [f32; 3], quat: [f32; 4]) {
+        self.slots[step as usize % POSE_RING].write(step, time_us, pos, quat);
         self.latest.store(step, Ordering::Release);
     }
 
     /// Writer side: publish a **teleport** — the pose is written for `step`
-    /// AND `step - 1`, so a reader interpolating across the boundary snaps
-    /// instead of sweeping the body through the world.
-    pub fn publish_snap(&self, step: u32, pos: [f32; 3], quat: [f32; 4]) {
+    /// AND `step - 1` (due at `prev_time_us`), so a reader interpolating
+    /// across the boundary snaps instead of sweeping the body through the
+    /// world.
+    pub fn publish_snap(
+        &self,
+        step: u32,
+        time_us: u32,
+        prev_time_us: u32,
+        pos: [f32; 3],
+        quat: [f32; 4],
+    ) {
         self.slots[step.wrapping_sub(1) as usize % POSE_RING].write(
             step.wrapping_sub(1),
+            prev_time_us,
             pos,
             quat,
         );
-        self.publish(step, pos, quat);
+        self.publish(step, time_us, pos, quat);
     }
 
     /// Latest published absolute step.
@@ -290,12 +370,12 @@ impl PoseRing {
     }
 
     /// The pose published for `step`, if the ring still holds it.
-    pub fn read_step(&self, step: u32) -> Option<([f32; 3], [f32; 4])> {
+    pub fn read_step(&self, step: u32) -> Option<StepPose> {
         self.slots[step as usize % POSE_RING].read(step)
     }
 
     /// The latest pose (always available once seeded).
-    pub fn read_latest(&self) -> ([f32; 3], [f32; 4]) {
+    pub fn read_latest(&self) -> StepPose {
         loop {
             let step = self.latest_step();
             if let Some(pose) = self.read_step(step) {
@@ -305,40 +385,78 @@ impl PoseRing {
             core::hint::spin_loop();
         }
     }
+
+    /// The published steps around display time `display_us`: walks back from
+    /// the newest step to the first one due at or before it. Usually one or
+    /// two steps back — the display time trails the newest step by less than
+    /// one step plus one burst.
+    pub fn bracket(&self, display_us: u32) -> Bracket {
+        let newest = self.read_latest();
+        if newest.step == 0 {
+            return Bracket::Early(newest); // only the startup seed so far
+        }
+        if time_diff_us(newest.time_us, display_us) < 0 {
+            return Bracket::Late(newest);
+        }
+        let mut newer = newest;
+        for _ in 1..POSE_RING {
+            let step = newer.step.wrapping_sub(1);
+            if step == 0 {
+                break; // the seed has no real time
+            }
+            match self.read_step(step) {
+                Some(older) if time_diff_us(older.time_us, display_us) <= 0 => {
+                    return Bracket::Between { older, newer };
+                }
+                Some(older) => newer = older,
+                // Overwritten, or before this body existed.
+                None => break,
+            }
+        }
+        Bracket::Early(newer)
+    }
 }
 
 /// The player ball's motion channel in the shared `WebAssembly.Memory`: a
-/// [`PoseRing`] of recent step poses (physics publishes every fixed step; the
-/// render thread samples the ring at its display-time cursor and
-/// lerps/slerps between the straddling steps), plus the frame-tick futex that
-/// paces the sim.
+/// [`PoseRing`] of recent step poses (physics publishes every fixed step with
+/// its due time; the render thread interpolates between the two steps around
+/// its display time), plus the frame tick and frame time that pace the sim.
 ///
 /// Pose is stored as position + quaternion (not a baked matrix) precisely so the
 /// reader can lerp position and *slerp* rotation correctly.
 ///
-/// ## Frame-tick: render drives the physics cadence
+/// ## Frame tick + frame time: render's clock paces the sim
 ///
-/// `frame_tick` flows the *other* way (render → physics). The render thread bumps
-/// it once per presented frame ([`bump_frame`]); the physics thread blocks on it
-/// ([`wait_frame`]) instead of running its own timer. This deliberately makes the
-/// sim step *in phase with vsync*: a free-running sim clock and the display's
-/// refresh are two independent clocks that **beat**, and every phase-slip
-/// surfaces as a one-frame stutter no matter how steady each clock is on its own.
-/// Driving physics from the frame it feeds removes the beat at the source — each
-/// presented frame gets a freshly-published pose, with the fixed-timestep
-/// accumulator still decoupling sim rate from refresh rate (so 120/144 Hz just
-/// means multiple frames between steps, interpolated). The wait/notify is a futex
-/// on the tick word (`memory.atomic.wait32` / `notify`).
+/// At the START of each frame the render thread stores the frame's rAF
+/// timestamp and bumps `frame_tick` ([`begin_frame`]); the physics thread
+/// blocks on the tick ([`wait_frame`]) and feeds its accumulator from the
+/// difference between successive frame times — not from its own clock read
+/// at wake-up, which carries the render thread's CPU time and the futex wake
+/// latency and would turn a steady 4 steps per 60 Hz frame into 3/4/5. With
+/// one clock the step count per frame only changes when the frame time does
+/// (see the module docs). Bumping at the start of the frame gives physics the
+/// whole frame period for its burst. The wait/notify is a futex on the tick
+/// word (`memory.atomic.wait32` / `notify`).
 ///
-/// [`bump_frame`]: BodyMotion::bump_frame
+/// [`begin_frame`]: BodyMotion::begin_frame
 /// [`wait_frame`]: BodyMotion::wait_frame
 #[repr(C)]
 pub struct BodyMotion {
     /// Pose history the render thread samples (see [`PoseRing`]).
     ring: PoseRing,
-    /// Bumped by render once per presented frame; physics blocks on it to pace
-    /// the sim to vsync (see the type docs).
+    /// Bumped by render at the start of every frame; physics blocks on it
+    /// (see the type docs).
     frame_tick: AtomicU32,
+    /// The latest frame's rAF timestamp as [`abs_time_us`], stored before the
+    /// tick bump. Physics steps to it.
+    frame_time_us: AtomicU32,
+    /// 0 until render has stored its first `frame_time_us`, then 1 forever.
+    /// Until then physics runs on its own clock.
+    frame_time_valid: AtomicU32,
+    /// Frames render drew while the newest published step was still older
+    /// than the frame's display time (physics late with its burst), wrapping.
+    /// The stats panel shows it as "app late".
+    app_late: AtomicU32,
     /// Accumulated render-thread CPU time, in MICROSECONDS (wrapping): how long
     /// each frame's work — interpolation, transform update, encode + submit —
     /// took on the render thread, summed across frames. The stats panel divides
@@ -351,19 +469,6 @@ pub struct BodyMotion {
     /// classification, pose publish — summed across steps. The stats panel
     /// divides its delta by the step-count delta for avg ms/step.
     step_work_us: AtomicU32,
-    /// Running max of the display cursor's |re-anchor error| (steps, `f32`
-    /// bits — IEEE ordering matches `u32` for non-negatives, so `fetch_max`
-    /// on the bits is max on the value). Render records it per frame; the
-    /// stats panel reads-and-resets. This is the render/physics sync-health
-    /// number: sustained values beyond the cursor's jitter budget
-    /// (`TARGET_LAG` steps) mean the interpolation is ramming its rails and
-    /// motion visibly pulses.
-    sync_err_bits: AtomicU32,
-    /// The render thread's CURRENT adaptive display lag (steps, `f32` bits) —
-    /// how far the display cursor trails the newest published pose. Grows to
-    /// absorb observed publish burstiness (see the render thread's cursor);
-    /// published here for the stats panel's sync line.
-    display_lag_bits: AtomicU32,
     /// GPU frame time, accumulated, in MICROSECONDS (wrapping): the renderer's
     /// running total of measured whole-frame GPU time
     /// (`awsm_renderer::profiling::gpu_frame_timing`, timestamp queries), as
@@ -381,7 +486,7 @@ pub struct BodyMotion {
     /// presented frame's. Diffed with `frame_tick`, the stats panel gets the
     /// span a window's frames covered, and so how many display refreshes went
     /// by with no new frame (see `refresh::Missed`). Added BEFORE the frame's
-    /// tick bump.
+    /// tick bump, at the start of the frame.
     frame_span_us: AtomicU32,
 }
 
@@ -391,10 +496,11 @@ impl BodyMotion {
         BodyMotion {
             ring: PoseRing::new(pos, quat),
             frame_tick: AtomicU32::new(0),
+            frame_time_us: AtomicU32::new(0),
+            frame_time_valid: AtomicU32::new(0),
+            app_late: AtomicU32::new(0),
             frame_work_us: AtomicU32::new(0),
             step_work_us: AtomicU32::new(0),
-            sync_err_bits: AtomicU32::new(0),
-            display_lag_bits: AtomicU32::new(0),
             gpu_total_us: AtomicU32::new(0),
             gpu_samples: AtomicU32::new(0),
             frame_span_us: AtomicU32::new(0),
@@ -417,27 +523,14 @@ impl BodyMotion {
         )
     }
 
-    /// Render side: record this frame's display-cursor |error| (steps).
-    pub fn note_sync_err(&self, err_abs: f32) {
-        self.sync_err_bits
-            .fetch_max(err_abs.to_bits(), Ordering::Relaxed);
+    /// Render side: count a frame drawn before physics finished its burst.
+    pub fn note_app_late(&self) {
+        self.app_late.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Stats side: the max |cursor error| (steps) since the last call, which
-    /// resets the running max to zero.
-    pub fn take_sync_err(&self) -> f32 {
-        f32::from_bits(self.sync_err_bits.swap(0, Ordering::Relaxed))
-    }
-
-    /// Render side: publish the current adaptive display lag (steps).
-    pub fn set_display_lag(&self, lag: f32) {
-        self.display_lag_bits
-            .store(lag.to_bits(), Ordering::Relaxed);
-    }
-
-    /// Stats side: the render thread's current adaptive display lag (steps).
-    pub fn display_lag(&self) -> f32 {
-        f32::from_bits(self.display_lag_bits.load(Ordering::Relaxed))
+    /// Stats side: frames drawn with physics late (wrapping — diff two reads).
+    pub fn app_late(&self) -> u32 {
+        self.app_late.load(Ordering::Relaxed)
     }
 
     /// Render side: add one frame's CPU work time (µs) to the running total.
@@ -473,12 +566,15 @@ impl BodyMotion {
         self.step_work_us.load(Ordering::Relaxed)
     }
 
-    /// Render side: signal that a frame was presented, waking the physics thread
-    /// to advance the sim for the next one. Cheap when physics is already running
-    /// (the `notify` is a no-op with no waiter; physics compares tick *values*, so
-    /// it can't miss a bump).
-    pub fn bump_frame(&self) {
-        self.frame_tick.fetch_add(1, Ordering::Relaxed);
+    /// Render side, at the start of a frame: publish the frame's time
+    /// ([`abs_time_us`] of its rAF timestamp), then bump the tick, waking
+    /// physics to simulate up to it. Cheap when physics is already running
+    /// (the `notify` is a no-op with no waiter; physics compares tick
+    /// *values*, so it can't miss a bump).
+    pub fn begin_frame(&self, time_us: u32) {
+        self.frame_time_us.store(time_us, Ordering::Relaxed);
+        self.frame_time_valid.store(1, Ordering::Relaxed);
+        self.frame_tick.fetch_add(1, Ordering::Release);
         // SAFETY: `frame_tick` lives in the shared memory both threads attach to.
         unsafe {
             memory_atomic_notify(self.frame_tick.as_ptr() as *mut i32, 1);
@@ -490,13 +586,21 @@ impl BodyMotion {
         self.frame_tick.load(Ordering::Relaxed)
     }
 
+    /// Physics side: the latest frame time render published, or `None`
+    /// before its first frame. Read after [`Self::wait_frame`] (whose Acquire
+    /// pairs with the tick's Release), so it is at least that frame's time.
+    pub fn frame_time_us(&self) -> Option<u32> {
+        (self.frame_time_valid.load(Ordering::Relaxed) != 0)
+            .then(|| self.frame_time_us.load(Ordering::Relaxed))
+    }
+
     /// Physics side: block until the frame-tick advances past `last`, returning the
     /// new value. Worker scope only — `memory.atomic.wait` traps on the main
     /// thread. Spurious wakeups + already-advanced ticks are both handled by the
     /// value re-check, so a presented frame is never missed.
     pub fn wait_frame(&self, last: u32) -> u32 {
         loop {
-            let cur = self.frame_tick.load(Ordering::Relaxed);
+            let cur = self.frame_tick.load(Ordering::Acquire);
             if cur != last {
                 return cur;
             }
@@ -509,33 +613,13 @@ impl BodyMotion {
         }
     }
 
-    /// Writer side (physics): publish the pose at absolute step `step`.
-    pub fn publish(&self, step: u32, pos: [f32; 3], quat: [f32; 4]) {
-        self.ring.publish(step, pos, quat);
-    }
-
-    /// Writer side: publish a teleport (snap — see [`PoseRing::publish_snap`]).
-    pub fn publish_snap(&self, step: u32, pos: [f32; 3], quat: [f32; 4]) {
-        self.ring.publish_snap(step, pos, quat);
-    }
-
     /// Latest published absolute step.
     pub fn latest_step(&self) -> u32 {
         self.ring.latest_step()
     }
 
-    /// The pose published for `step`, if the ring still holds it.
-    pub fn read_step(&self, step: u32) -> Option<([f32; 3], [f32; 4])> {
-        self.ring.read_step(step)
-    }
-
-    /// The latest pose (always available once seeded).
-    pub fn read_latest(&self) -> ([f32; 3], [f32; 4]) {
-        self.ring.read_latest()
-    }
-
-    /// The underlying pose ring (render samples it — see `sample_ring` in the
-    /// render thread).
+    /// The underlying pose ring: physics publishes into it, render brackets
+    /// its display time in it (see [`PoseRing::bracket`]).
     pub fn ring(&self) -> &PoseRing {
         &self.ring
     }
@@ -559,15 +643,21 @@ pub const HELD_RIGHT: u32 = 1 << 3;
 pub struct InputState {
     /// Bitset of currently-held movement keys (`HELD_*`).
     held: AtomicU32,
+    /// Movement keys pressed since physics last looked (`HELD_*`): set with
+    /// `held` on keydown, taken (cleared) by physics once per step and OR'd
+    /// into `held`. A tap whose keydown AND keyup both land between two steps
+    /// clears `held` before physics ever sees it; this latch still gives it
+    /// one step, so every press is simulated.
+    pressed: AtomicU32,
     /// Bumped once per discrete jump press. Physics edge-detects a jump by
     /// diffing this against the value it last saw (so a press = exactly one hop,
     /// even though physics polls rather than receives an event).
     jump_seq: AtomicU32,
-    /// Camera yaw in radians (`f32::to_bits`), accumulated by main from the
-    /// orbit drags with [`CAMERA_ORBIT_SENSITIVITY`] — the same integration the
-    /// render thread's `OrbitCamera` does, so the two stay in lockstep. Physics
-    /// rotates the held-key roll direction by this so W/A/S/D stay
-    /// camera-relative at any orbit angle.
+    /// Camera yaw in radians (`f32::to_bits`) of main's [`OrbitCamera`], set on
+    /// every orbit drag. Physics rotates the held-key roll direction by this
+    /// so W/A/S/D stay camera-relative at any orbit angle. (It is the newest
+    /// yaw, about a frame ahead of the one on screen — a few degrees at most
+    /// mid-drag, and the same as before the camera moved to [`CameraRing`].)
     camera_yaw: AtomicU32,
     /// Touch fling: bumped once per swipe gesture (edge-detected like
     /// `jump_seq`). The velocity is valid at the seq bump — values are stored
@@ -591,6 +681,7 @@ impl InputState {
     pub const fn new() -> Self {
         InputState {
             held: AtomicU32::new(0),
+            pressed: AtomicU32::new(0),
             jump_seq: AtomicU32::new(0),
             camera_yaw: AtomicU32::new(0), // 0u32 == 0.0f32.to_bits()
             fling_seq: AtomicU32::new(0),
@@ -603,6 +694,7 @@ impl InputState {
     pub fn set_held(&self, mask: u32, down: bool) {
         if down {
             self.held.fetch_or(mask, Ordering::Relaxed);
+            self.pressed.fetch_or(mask, Ordering::Relaxed);
         } else {
             self.held.fetch_and(!mask, Ordering::Relaxed);
         }
@@ -613,9 +705,10 @@ impl InputState {
         self.jump_seq.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Physics side: the current held-key bitset.
-    pub fn held(&self) -> u32 {
-        self.held.load(Ordering::Relaxed)
+    /// Physics side, once per step: the keys to act on this step — those held
+    /// now plus any pressed since the previous step (see `pressed`).
+    pub fn take_held(&self) -> u32 {
+        self.held.load(Ordering::Relaxed) | self.pressed.swap(0, Ordering::Relaxed)
     }
 
     /// Physics side: the jump counter (diff against your last-seen to edge-detect).
@@ -822,27 +915,170 @@ pub enum ResizeMsg {
     Canvas { width: u32, height: u32 },
 }
 
-/// Radians of camera yaw per CSS pixel of horizontal drag. Lives here because
-/// TWO integrators must agree on it: the render thread's `OrbitCamera` (the
-/// visual) and the main thread's accumulated yaw (fed to physics for
-/// camera-relative W/A/S/D and to audio for the orbiting listener). Both apply
-/// `yaw -= dx * CAMERA_ORBIT_SENSITIVITY` to the same deltas from the same
-/// start, so they stay in lockstep without ever exchanging the angle itself.
+/// Radians of camera yaw (and pitch) per CSS pixel of drag.
 pub const CAMERA_ORBIT_SENSITIVITY: f32 = 0.005;
 
-/// Main thread → render thread. The main thread owns the DOM (hence the
-/// pointer events), but the camera lives in the render thread, so orbit/zoom
-/// gestures are forwarded here. Cold path — one message per pointer move/wheel
-/// tick, never per frame. (No pan: the camera stays aimed at the table so it
-/// can never leave the frame.)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "cam", rename_all = "kebab-case")]
-pub enum CameraMsg {
-    /// A drag delta (pointer movement in CSS pixels) while the right mouse
-    /// button is held — orbits the camera (yaw from `dx`, pitch from `dy`).
-    Orbit { dx: f32, dy: f32 },
-    /// A wheel delta — dollies the camera in/out.
-    Zoom { dy: f32 },
+/// A minimal mouse-driven orbit camera (after the renderer's `model-tests`
+/// `OrbitCamera`): it circles a fixed `look_at` point at spherical
+/// `(yaw, pitch, radius)`. Right-drag to orbit, wheel to dolly (no pan — the
+/// table can never leave the frame).
+///
+/// The MAIN thread owns the live one: it applies every drag and wheel event
+/// (with the clamps below), fans the yaw out to physics and audio, and once
+/// per main-thread frame writes `(yaw, pitch, radius)` into the
+/// [`CameraRing`]. The render thread keeps a copy it overwrites from the ring
+/// each frame, and only uses it for drawing and click unprojection.
+#[derive(Debug, Clone, Copy)]
+pub struct OrbitCamera {
+    pub look_at: glam::Vec3,
+    pub radius: f32,
+    pub yaw: f32,
+    pub pitch: f32,
+}
+
+impl OrbitCamera {
+    /// Just under 90° so the camera never flips over the pole.
+    pub const PITCH_MAX: f32 = std::f32::consts::FRAC_PI_2 - 0.01;
+    /// Floor keeps the eye above the table rim — never under the felt, and the
+    /// playfield stays readable even at the shallowest angle.
+    pub const PITCH_MIN: f32 = 0.15;
+    pub const MIN_RADIUS: f32 = 2.0;
+    pub const MAX_RADIUS: f32 = 25.0;
+
+    /// The opening view, the same on both threads: head-on from +Z, tilted
+    /// ~26° down, looking just above the table.
+    pub fn start() -> Self {
+        Self {
+            look_at: glam::Vec3::new(0.0, 0.4, 0.0),
+            radius: 9.0,
+            yaw: 0.0,
+            pitch: 0.46,
+        }
+    }
+
+    /// Apply a drag delta (CSS pixels): horizontal → yaw, vertical → pitch.
+    pub fn orbit(&mut self, dx: f32, dy: f32) {
+        self.yaw -= dx * CAMERA_ORBIT_SENSITIVITY;
+        self.pitch =
+            (self.pitch - dy * CAMERA_ORBIT_SENSITIVITY).clamp(Self::PITCH_MIN, Self::PITCH_MAX);
+    }
+
+    /// Apply a wheel delta — positive `dy` (scroll down) dollies out.
+    pub fn zoom(&mut self, dy: f32) {
+        self.radius = (self.radius * (1.0 + dy * 0.001)).clamp(Self::MIN_RADIUS, Self::MAX_RADIUS);
+    }
+
+    /// Camera world position from spherical coords (yaw 0 = looking from +Z).
+    pub fn eye(&self) -> glam::Vec3 {
+        let (sy, cy) = self.yaw.sin_cos();
+        let (sp, cp) = self.pitch.sin_cos();
+        self.look_at
+            + glam::Vec3::new(
+                self.radius * cp * sy,
+                self.radius * sp,
+                self.radius * cp * cy,
+            )
+    }
+}
+
+/// Slots in the [`CameraRing`]: render reads a slot about one main-thread
+/// frame old, so a few frames of history is plenty.
+pub const CAMERA_RING: usize = 4;
+
+/// One main-thread frame's camera, seqlock'd (odd `seq` = being written).
+#[repr(C)]
+struct CameraSlot {
+    seq: AtomicU32,
+    /// The main-thread rAF timestamp it was written in, as [`abs_time_us`].
+    time_us: AtomicU32,
+    yaw: AtomicU32,
+    pitch: AtomicU32,
+    radius: AtomicU32,
+}
+
+/// The camera, main → render, once per main-thread frame (shared memory, so
+/// no message queue sits between pointer input and the render loop).
+///
+/// Why a ring of timestamped frames instead of "the latest value": pointer
+/// events reach the main thread once per frame, aligned to ITS
+/// `requestAnimationFrame`, while the render worker runs its own
+/// `requestAnimationFrame`. Reading "the latest" races the two: a render frame
+/// that starts just before main writes sees nothing new, and the next sees two
+/// frames' worth — the orbit judders 0/2. Instead render takes the newest
+/// slot written at least half a frame before its own frame time, which is
+/// main's PREVIOUS frame: exactly one frame of input per drawn frame, one
+/// frame of latency, no race.
+#[repr(C)]
+pub struct CameraRing {
+    /// Slots written so far (wrapping); the newest is `(writes − 1) % CAMERA_RING`.
+    writes: AtomicU32,
+    slots: [CameraSlot; CAMERA_RING],
+}
+
+impl Default for CameraRing {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CameraRing {
+    pub fn new() -> Self {
+        CameraRing {
+            writes: AtomicU32::new(0),
+            slots: core::array::from_fn(|_| CameraSlot {
+                seq: AtomicU32::new(0),
+                time_us: AtomicU32::new(0),
+                yaw: AtomicU32::new(0),
+                pitch: AtomicU32::new(0),
+                radius: AtomicU32::new(0),
+            }),
+        }
+    }
+
+    /// Main side (the sole writer), once per main-thread frame in which the
+    /// camera changed: overwrite the oldest slot.
+    pub fn write(&self, time_us: u32, camera: &OrbitCamera) {
+        let n = self.writes.load(Ordering::Relaxed);
+        let slot = &self.slots[n as usize % CAMERA_RING];
+        let v = slot.seq.load(Ordering::Relaxed);
+        slot.seq.store(v.wrapping_add(1), Ordering::Relaxed); // odd: in flight
+        fence(Ordering::Release);
+        slot.time_us.store(time_us, Ordering::Relaxed);
+        slot.yaw.store(camera.yaw.to_bits(), Ordering::Relaxed);
+        slot.pitch.store(camera.pitch.to_bits(), Ordering::Relaxed);
+        slot.radius
+            .store(camera.radius.to_bits(), Ordering::Relaxed);
+        fence(Ordering::Release);
+        slot.seq.store(v.wrapping_add(2), Ordering::Relaxed); // even: done
+        self.writes.store(n.wrapping_add(1), Ordering::Release);
+    }
+
+    /// Render side: `(yaw, pitch, radius)` from the newest slot written at or
+    /// before `cutoff_us`, skipping a slot being rewritten. `None` before the
+    /// first write, or when no slot qualifies (keep the camera you have).
+    pub fn read_at(&self, cutoff_us: u32) -> Option<(f32, f32, f32)> {
+        let n = self.writes.load(Ordering::Acquire);
+        for back in 1..=(n.min(CAMERA_RING as u32)) {
+            let slot = &self.slots[n.wrapping_sub(back) as usize % CAMERA_RING];
+            let v1 = slot.seq.load(Ordering::Relaxed);
+            if v1 & 1 != 0 {
+                continue; // being rewritten (main has lapped us) — try older
+            }
+            fence(Ordering::Acquire);
+            let time_us = slot.time_us.load(Ordering::Relaxed);
+            let yaw = f32::from_bits(slot.yaw.load(Ordering::Relaxed));
+            let pitch = f32::from_bits(slot.pitch.load(Ordering::Relaxed));
+            let radius = f32::from_bits(slot.radius.load(Ordering::Relaxed));
+            fence(Ordering::Acquire);
+            if slot.seq.load(Ordering::Relaxed) != v1 {
+                continue; // torn — try older
+            }
+            if time_diff_us(time_us, cutoff_us) <= 0 {
+                return Some((yaw, pitch, radius));
+            }
+        }
+        None
+    }
 }
 
 // Main → physics input is no longer a message: it's the shared-memory

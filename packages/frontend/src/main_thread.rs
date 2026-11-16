@@ -9,6 +9,9 @@
 //!    **physics** worker with that payload (the shared-memory binding).
 //! 4. Translate keyboard input into the shared [`InputState`] block the physics
 //!    worker polls (no per-keystroke `postMessage`).
+//! 5. Own the orbit camera: apply every drag and wheel event to it, and once
+//!    per main-thread frame write it into the shared [`CameraRing`] the
+//!    render worker reads (see that type for why it is a timestamped ring).
 //!
 //! The DOM here stays deliberately thin (a canvas + a static controls HUD whose
 //! one live line is a `futures-signals` `Mutable`) — the point of the template
@@ -31,8 +34,8 @@ use crate::audio::AudioController;
 use crate::bootstrap::{spawn_shared_worker, spawn_shared_worker_transfer};
 use crate::physics_tasks::TaskPool;
 use crate::protocol::{
-    AudioMsg, BallMotions, BodyMotion, CameraMsg, DropMsg, InputState, PhysicsMsg, QualityMsg,
-    RenderMsg, ResizeMsg, CAMERA_ORBIT_SENSITIVITY, HELD_BACK, HELD_FORWARD, HELD_LEFT, HELD_RIGHT,
+    abs_time_us, AudioMsg, BallMotions, BodyMotion, CameraRing, DropMsg, InputState, OrbitCamera,
+    PhysicsMsg, QualityMsg, RenderMsg, ResizeMsg, HELD_BACK, HELD_FORWARD, HELD_LEFT, HELD_RIGHT,
 };
 
 /// Shared, lazily-loaded audio. `None` until the export finishes loading; stays
@@ -321,10 +324,10 @@ struct StatsRefs {
     pool: Option<(usize, u32)>,
 }
 
-/// The stats panel's renderable state: plain text above and below the sync
-/// line, plus the sync line itself with its health flag — split out so the
-/// DOM can color just that line red when sync is genuinely bad (see
-/// `install_stats` for what "bad" means).
+/// The stats panel's renderable state: plain text above and below the
+/// "app late" line, plus that line itself with its health flag — split out so
+/// the DOM can color just that line red when physics is persistently late
+/// (see `install_stats` for what "bad" means).
 #[derive(Clone, Default)]
 struct StatsText {
     head: String,
@@ -348,6 +351,8 @@ struct StatsSample {
     /// Accumulated time between presented frames (µs, wrapping) — see
     /// `BodyMotion::frame_span_us`.
     frame_span_us: u32,
+    /// Frames drawn with physics late (wrapping) — `BodyMotion::app_late`.
+    app_late: u32,
     /// Per-executor accumulated task CPU µs (index 0 = the physics thread).
     task_us: Vec<u32>,
 }
@@ -424,8 +429,8 @@ pub fn start() -> Result<(), JsValue> {
         .child(html!("div", {
             .class("stats")
             .visible_signal(stats_open.signal())
-            // Three nodes so JUST the sync line can turn red when bad: the
-            // text above it, the sync line span, the text below it.
+            // Three nodes so JUST the "app late" line can turn red when bad:
+            // the text above it, that line's span, the text below it.
             .text_signal(stats.signal_cloned().map(|s| s.head))
             .child(html!("span", {
                 .class_signal("sync-bad", stats.signal_cloned().map(|s| s.bad))
@@ -779,21 +784,27 @@ fn setup(
     // parse). On `task dev` the page is at `/`, so this collapses to the origin.
     let base = page_base(&window);
 
-    // The camera yaw, accumulated from orbit drags in `install_pointer`. Main
-    // owns it and fans it out: into the shared `InputState` (physics makes
-    // W/A/S/D camera-relative) and onto the audio listener (the stereo image
-    // tracks the view). The render thread integrates the same deltas with the
-    // same sensitivity into its `OrbitCamera`, so all three agree.
-    let camera_yaw = Rc::new(Cell::new(0.0_f32));
+    // The orbit camera. Main owns it (it has the pointer events): drags and
+    // the wheel change it in `install_pointer`, which fans the yaw out into
+    // the shared `InputState` (physics makes W/A/S/D camera-relative) and onto
+    // the audio listener (the stereo image tracks the view). Once per main
+    // frame it goes to the render worker through the `CameraRing`.
+    let camera = Rc::new(RefCell::new(OrbitCamera::start()));
+    // Leaked: it lives in the shared memory for the session, and the render
+    // worker gets its address in the spawn payload.
+    let camera_ring: &'static CameraRing = Box::leak(Box::new(CameraRing::new()));
+    // Set by a drag or wheel; the frame loop writes the ring only then.
+    let camera_dirty = Rc::new(Cell::new(false));
+    install_camera_frames(&window, camera.clone(), camera_ring, camera_dirty.clone())?;
 
     // Kick off the (async) audio load now; it stays silent until the first
     // gesture. `None` until ready, so input/handlers no-op against it meanwhile.
     let audio: Audio = Rc::new(RefCell::new(None));
-    spawn_local(clone!(audio, status, base, camera_yaw => async move {
+    spawn_local(clone!(audio, status, base, camera => async move {
         match AudioController::load(&base).await {
             Ok(mut controller) => {
                 // Catch the listener up in case the player orbited during load.
-                controller.set_camera_yaw(camera_yaw.get());
+                controller.set_camera_yaw(camera.borrow().yaw);
                 *audio.borrow_mut() = Some(controller);
                 tracing::info!("main thread: audio loaded");
                 loading_log("audio project loaded (roll + hit/land voices)");
@@ -824,6 +835,11 @@ fn setup(
     let (msaa0, smaa0) = aa.get().flags();
     set(&payload, "msaa", &JsValue::from_bool(msaa0));
     set(&payload, "smaa", &JsValue::from_bool(smaa0));
+    set(
+        &payload,
+        "camera_ptr",
+        &JsValue::from_f64(camera_ring as *const CameraRing as usize as f64),
+    );
     let transfer = js_sys::Array::new();
     transfer.push(&offscreen);
 
@@ -1024,8 +1040,8 @@ fn setup(
 
     // Left-clicks drop balls (relayed to render for unprojection); right-drags
     // orbit and the wheel zooms; a pointerdown is also the gesture that starts
-    // audio. Orbit drags also advance `camera_yaw` and fan it out (see above).
-    install_pointer(&window, &canvas, render, audio, input, camera_yaw)?;
+    // audio. Orbit drags and the wheel change `camera` (see above).
+    install_pointer(&window, &canvas, render, audio, input, camera, camera_dirty)?;
 
     status.set("loading scene…".into());
     Ok(())
@@ -1233,12 +1249,12 @@ struct Swipe {
 }
 
 /// Wire pointer input: a **left click drops a ball** — the click point goes to
-/// the render worker as a [`DropMsg`] in NDC (render owns the camera, so it
-/// does the unprojection onto the table). A **right-button drag orbits** and
-/// the **wheel zooms**, relayed as [`CameraMsg`]s; the orbit drag ALSO
-/// accumulates `yaw` here (same deltas × same sensitivity as the render
-/// thread's `OrbitCamera`) and fans it out to the shared [`InputState`]
-/// (camera-relative W/A/S/D) and the audio listener (camera-relative stereo).
+/// the render worker as a [`DropMsg`] in NDC (render does the unprojection
+/// onto the table, through the camera it last drew). A **right-button drag
+/// orbits** and the **wheel zooms** main's [`OrbitCamera`] (marking it dirty
+/// for the next [`CameraRing`] write); an orbit also fans the new yaw out to
+/// the shared [`InputState`] (camera-relative W/A/S/D) and the audio listener
+/// (camera-relative stereo).
 /// A **touch swipe flings the ball**: the swipe's release velocity becomes a
 /// camera-frame fling in the shared [`InputState`] (physics turns it into the
 /// ball's horizontal velocity); a short still touch stays a tap → drop.
@@ -1248,7 +1264,8 @@ fn install_pointer(
     render: Worker,
     audio: Audio,
     input: &'static InputState,
-    yaw: Rc<Cell<f32>>,
+    camera: Rc<RefCell<OrbitCamera>>,
+    camera_dirty: Rc<Cell<bool>>,
 ) -> Result<(), JsValue> {
     // Set when a touch swipe just flung the ball: the browser still
     // synthesizes a `click` on the canvas after the pointer sequence, and a
@@ -1330,11 +1347,11 @@ fn install_pointer(
     menu.forget();
 
     // pointermove on the window so a drag keeps orbiting even off-canvas. The
-    // orbit delta goes to render (the visual), and its dx also advances OUR
-    // yaw with the same sensitivity — fanned out to physics (shared input
-    // block) and the audio listener, keeping all three frames in lockstep.
+    // orbit turns main's camera; the new yaw goes straight to physics (shared
+    // input block) and the audio listener, and the whole camera to render
+    // with the next frame's `CameraRing` write.
     let move_ = Closure::<dyn FnMut(web_sys::PointerEvent)>::new(
-        clone!(dragging, render, audio, yaw, swipe => move |e: web_sys::PointerEvent| {
+        clone!(dragging, audio, camera, camera_dirty, swipe => move |e: web_sys::PointerEvent| {
             // Touch swipe: record the sample; velocity is computed at lift.
             if let Some(s) = swipe.borrow_mut().as_mut() {
                 if e.pointer_id() == s.id {
@@ -1350,15 +1367,16 @@ fn install_pointer(
                 return;
             }
             if dragging.get() {
-                let dx = e.movement_x() as f32;
-                let dy = e.movement_y() as f32;
-                let y = yaw.get() - dx * CAMERA_ORBIT_SENSITIVITY;
-                yaw.set(y);
+                let y = {
+                    let mut cam = camera.borrow_mut();
+                    cam.orbit(e.movement_x() as f32, e.movement_y() as f32);
+                    cam.yaw
+                };
+                camera_dirty.set(true);
                 input.set_camera_yaw(y);
                 if let Some(c) = audio.borrow_mut().as_mut() {
                     c.set_camera_yaw(y);
                 }
-                post_camera(&render, &CameraMsg::Orbit { dx, dy });
             }
         }),
     );
@@ -1422,25 +1440,52 @@ fn install_pointer(
     cancel.forget();
 
     // wheel on the canvas zooms (preventDefault so the page doesn't scroll).
-    let wheel = Closure::<dyn FnMut(web_sys::WheelEvent)>::new(
-        clone!(render => move |e: web_sys::WheelEvent| {
-            e.prevent_default();
-            post_camera(&render, &CameraMsg::Zoom { dy: e.delta_y() as f32 });
-        }),
-    );
+    let wheel = Closure::<dyn FnMut(web_sys::WheelEvent)>::new(move |e: web_sys::WheelEvent| {
+        e.prevent_default();
+        camera.borrow_mut().zoom(e.delta_y() as f32);
+        camera_dirty.set(true);
+    });
     canvas.add_event_listener_with_callback("wheel", wheel.as_ref().unchecked_ref())?;
     wheel.forget();
 
     Ok(())
 }
 
-fn post_camera(render: &Worker, msg: &CameraMsg) {
-    match serde_wasm_bindgen::to_value(msg) {
-        Ok(v) => {
-            let _ = render.post_message(&v);
+/// A self-rescheduling `requestAnimationFrame` callback.
+type FrameLoop = Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>>;
+
+/// The main thread's own `requestAnimationFrame` loop for the camera: in
+/// every frame the camera changed in, write it into the [`CameraRing`]
+/// stamped with this frame's time. Pointer events are delivered before the
+/// frame's rAF callbacks, so each write holds exactly that frame's input; the
+/// render worker picks the previous frame's write (see [`CameraRing`]).
+fn install_camera_frames(
+    window: &web_sys::Window,
+    camera: Rc<RefCell<OrbitCamera>>,
+    ring: &'static CameraRing,
+    dirty: Rc<Cell<bool>>,
+) -> Result<(), JsValue> {
+    let time_origin = window
+        .performance()
+        .ok_or_else(|| JsValue::from_str("no performance"))?
+        .time_origin();
+    let cb: FrameLoop = Rc::new(RefCell::new(None));
+    let next = cb.clone();
+    let win = window.clone();
+    *cb.borrow_mut() = Some(Closure::new(move |t: f64| {
+        if dirty.replace(false) {
+            ring.write(abs_time_us(time_origin, t), &camera.borrow());
         }
-        Err(e) => tracing::error!("serialize CameraMsg: {e}"),
+        if let Some(f) = next.borrow().as_ref() {
+            let _ = win.request_animation_frame(f.as_ref().unchecked_ref());
+        }
+    }));
+    if let Some(f) = cb.borrow().as_ref() {
+        window.request_animation_frame(f.as_ref().unchecked_ref())?;
     }
+    // Runs for the session; the closure keeps itself alive.
+    std::mem::forget(cb);
+    Ok(())
 }
 
 /// Attach `keydown`/`keyup` listeners that translate WASD/arrows into the shared
@@ -1507,15 +1552,10 @@ const STATS_EMA_ALPHA: f64 = 0.35;
 /// measures the stall, not the framerate. Either way we re-baseline instead.
 const STATS_MIN_WINDOW_MS: f64 = 200.0;
 const STATS_MAX_WINDOW_MS: f64 = 3000.0;
-/// The sync line's "ROUGH" condition, part 1: the per-window worst display-
-/// cursor error (steps) that counts a window as rough…
-const SYNC_ROUGH_ERR: f32 = 3.0;
-/// …part 2: only while the adaptive lag is pinned at (essentially) its
-/// ceiling — below that the buffer still has headroom and will grow.
-const SYNC_ROUGH_LAG: f32 = 23.0;
-/// …part 3: consecutive rough windows before the line turns red. One spike
-/// is an event (tab switch, AA recompile); persistence is a condition.
-const SYNC_ROUGH_WINDOWS: u32 = 3;
+/// Consecutive windows with physics late before the "app late" line turns
+/// red. One late frame is an event (a tab switch, an AA recompile, a big pile
+/// of balls landing); persistence is a condition.
+const LATE_BAD_WINDOWS: u32 = 3;
 
 /// Frames that must present AFTER render reports `Ready` before counting
 /// starts. Boot isn't steady state — the loading overlay is fading, the
@@ -1559,14 +1599,10 @@ const STATS_WARMUP_FRAMES: u32 = 60;
 ///   construction) — watch it grow as balls pile up; the budget at `SIM_HZ`
 ///   240 is ~4.2 ms/step,
 /// - physics: fixed steps/s (locked to `SIM_HZ` when healthy),
-/// - sync: render/physics sync health. Normally `ok · lag N` — N (steps) is
-///   the adaptive display lag, which grows to swallow bursty pose publishing
-///   (phone thread contention). It flips to a RED `ROUGH ±E · lag N` only
-///   when the condition is genuinely bad: the per-window worst cursor error
-///   stays ≥ [`SYNC_ROUGH_ERR`] steps for [`SYNC_ROUGH_WINDOWS`] consecutive
-///   windows while the lag is pinned at its ceiling — i.e. the jitter exceeds
-///   what the buffer may absorb and motion is visibly pulsing. One-off spikes
-///   (tab switch, AA recompile) never trip it — the lag grows and it's over,
+/// - app late: frames drawn before physics had finished the burst they show
+///   (`BodyMotion::app_late`), per second and in total. Each one is a frame
+///   that repeats the previous picture of the world. RED once it persists for
+///   [`LATE_BAD_WINDOWS`] windows: the physics thread can't keep up,
 /// - physics pool / physics main: how the solver's task CPU time split this
 ///   window between the pool workers and the physics thread help-executing in
 ///   `finishTask` — a share of measured µs, not of task counts,
@@ -1608,9 +1644,10 @@ fn install_stats(
     // evidently has no `timestamp-query` and the line says so.
     let mut gpu_empty_windows: u32 = 0;
     let mut step_work_ema: Option<f64> = None;
-    // Consecutive windows the sync condition has been rough (see the doc
-    // comment's ROUGH definition) — the line turns red at the threshold.
-    let mut rough_windows: u32 = 0;
+    // Late frames since counting started (wrapping), and consecutive windows
+    // with any — the line turns red at `LATE_BAD_WINDOWS`.
+    let mut late_total: u32 = 0;
+    let mut late_windows: u32 = 0;
     // The frame-tick value when `Ready` was first observed — counting starts
     // `STATS_WARMUP_FRAMES` presented frames after it.
     let mut warm_frame: Option<u32> = None;
@@ -1627,14 +1664,11 @@ fn install_stats(
                 motion.latest_step(),
                 motion.frame_work_us(),
                 motion.step_work_us(),
-                // Read-and-reset every tick (even during warm-up) so the
-                // boot spike drains before the first displayed window.
-                motion.take_sync_err(),
-                motion.display_lag(),
+                motion.app_late(),
             )
         });
-        let (frame, step, frame_work_us, step_work_us, sync_err, lag) =
-            motion_counts.unwrap_or((0, 0, 0, 0, 0.0, 0.0));
+        let (frame, step, frame_work_us, step_work_us, app_late) =
+            motion_counts.unwrap_or((0, 0, 0, 0, 0));
         // Read AFTER the frame tick: render adds a frame's span before bumping
         // its tick, so this span covers at least the frames counted above.
         let frame_span_us = refs
@@ -1660,6 +1694,7 @@ fn install_stats(
             step_work_us,
             gpu: gpu_totals,
             frame_span_us,
+            app_late,
             task_us: task_us.clone(),
         });
 
@@ -1670,6 +1705,8 @@ fn install_stats(
             step_work_ema = None;
             gpu_ema = None;
             missed.reset();
+            late_total = 0;
+            late_windows = 0;
             stats.set(StatsText {
                 head: "workers\n  main          ui · audio · input\n  render        \
                        starting…\n  physics       starting…"
@@ -1764,17 +1801,17 @@ fn install_stats(
             cpu(step_work_ema, 2),
             *s,
         );
-        // Sync health (see the doc comment's ROUGH definition): rough = big
-        // worst-case error while the adaptive lag is already pinned at its
-        // ceiling; RED only when that persists across consecutive windows.
-        let rough_now = sync_err >= SYNC_ROUGH_ERR && lag >= SYNC_ROUGH_LAG;
-        rough_windows = if rough_now { rough_windows + 1 } else { 0 };
-        let bad = rough_windows >= SYNC_ROUGH_WINDOWS;
-        let sync = if bad {
-            format!("  sync          ROUGH ±{sync_err:.1} · lag {lag:.0}")
-        } else {
-            format!("  sync          ok · lag {lag:.0}")
-        };
+        // Physics late (see the doc comment): RED only when it persists
+        // across consecutive windows.
+        let late = app_late.wrapping_sub(prev.app_late);
+        late_total = late_total.wrapping_add(late);
+        late_windows = if late > 0 { late_windows + 1 } else { 0 };
+        let bad = late_windows >= LATE_BAD_WINDOWS;
+        let sync = format!(
+            "  app late      {:.0}/s · {} total",
+            late as f64 / dt,
+            late_total
+        );
 
         let mut lines = String::new();
 

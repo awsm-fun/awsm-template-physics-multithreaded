@@ -13,19 +13,24 @@
 //! no core headroom the world falls back to `workerCount = 1` (Box3D's inline
 //! serial path — no scheduler at all).
 //!
-//! The sim runs at a **fixed timestep** (`protocol::SIM_HZ`) decoupled from the wall clock: an
-//! accumulator tracks elapsed real time and we step Box3D exactly as many fixed
-//! steps as that time bought (capped, to avoid a spiral of death) — so the
-//! simulation stays correct and real-time regardless of how heavy a step gets.
-//! Each step we publish the ball's prev/curr pose into the shared [`BodyMotion`]
-//! buffer; the render thread interpolates and draws it.
+//! The sim runs at a **fixed timestep** (`protocol::SIM_HZ`): an accumulator
+//! tracks elapsed time and we step Box3D exactly as many fixed steps as that
+//! time bought (capped, to avoid a spiral of death) — so the simulation stays
+//! correct and real-time regardless of how heavy a step gets. Each step we
+//! publish every body's pose, stamped with the time that step is due, into the
+//! shared pose rings; the render thread interpolates and draws them.
 //!
-//! **The render thread paces the sim, not a timer.** Each loop iteration blocks
-//! on the [`BodyMotion`] frame-tick (`memory.atomic.wait`) until render presents a
-//! frame, then advances and publishes the pose that frame's successor will read.
-//! This locks the step cadence to vsync: a physics timer running on its *own*
-//! clock beats against the display's refresh, and every phase-slip becomes a
-//! one-frame stutter. See [`BodyMotion`].
+//! **The render thread's clock paces the sim, not a timer and not our own
+//! clock.** Each loop iteration blocks on the [`BodyMotion`] frame tick
+//! (`memory.atomic.wait`), which render bumps at the start of every frame
+//! after publishing that frame's rAF timestamp. The accumulator advances by
+//! the difference between successive frame timestamps — Fix Your Timestep's
+//! `accumulator += frameTime`, with `frameTime` measured once per frame on
+//! the display's clock. (Reading our own clock at wake-up instead would add
+//! the render thread's CPU time and the wake latency, which wobble frame to
+//! frame and turn a steady 4 steps per 60 Hz frame into 3/4/5.) See the
+//! `protocol` module docs for how render turns the stamped steps back into a
+//! smooth picture.
 //!
 //! Blocking the worker like this means it has no event loop to receive messages
 //! on, so **input is shared memory, not messages**: main writes held keys / jumps
@@ -43,8 +48,8 @@ use wasm_bindgen::JsCast;
 use web_sys::js_sys;
 
 use crate::protocol::{
-    AudioMsg, BallMotions, BodyMotion, ColliderShapeMsg, InputState, PhysicsInit, HELD_BACK,
-    HELD_FORWARD, HELD_LEFT, HELD_RIGHT, ROLE_FLOOR, ROLE_WALL, SIM_HZ,
+    abs_time_us, AudioMsg, BallMotions, BodyMotion, ColliderShapeMsg, InputState, PhysicsInit,
+    HELD_BACK, HELD_FORWARD, HELD_LEFT, HELD_RIGHT, POSE_RING, ROLE_FLOOR, ROLE_WALL, SIM_HZ,
 };
 
 /// Fixed simulation step, derived from the shared [`SIM_HZ`] (the one rate knob).
@@ -64,6 +69,10 @@ const MAX_FRAME_MS: f64 = 100.0;
 /// trigger a spiral of death. Derived to always cover a full [`MAX_FRAME_MS`] gap
 /// at the current rate (≈6 at 60 Hz, ≈24 at 240 Hz), so it scales with [`SIM_HZ`].
 const MAX_SUBSTEPS: u32 = (MAX_FRAME_MS / 1000.0 * SIM_HZ + 0.999) as u32;
+// While render reads the two steps the previous burst left, this burst may
+// write a full `MAX_SUBSTEPS` more into the same pose ring: it must not lap
+// them. Raising `SIM_HZ` (or `MAX_FRAME_MS`) past this needs a deeper ring.
+const _: () = assert!(MAX_SUBSTEPS as usize + 2 <= POSE_RING);
 const GRAVITY: f32 = -9.81;
 /// How far above its authored position the ball starts, so it drops in.
 const DROP_HEIGHT: f32 = 2.0;
@@ -172,7 +181,8 @@ pub fn start(payload: JsValue) -> Result<(), JsValue> {
     // kept alive (leaked) by the render thread for the session.
     let motion: &'static BodyMotion = unsafe { &*(init.motion_ptr as usize as *const BodyMotion) };
 
-    // `performance.now()` (this worker's clock) drives the accumulator.
+    // `performance` for the step-cost telemetry, and as the fallback clock
+    // until render has published its first frame time.
     let perf = js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("performance"))
         .ok()
         .and_then(|p| p.dyn_into::<web_sys::Performance>().ok())
@@ -337,25 +347,31 @@ pub fn start(payload: JsValue) -> Result<(), JsValue> {
     let mut step_ms_count: u32 = 0;
 
     // Fixed-timestep accumulator; every step's pose is published into the
-    // shared pose rings (render samples them at its own display time).
+    // shared pose rings, stamped with the time it is due.
     let mut total_steps: u32 = 0;
     let mut accumulator: f64 = 0.0;
-    let mut last_time = perf.now();
+    // The frame time of the previous wake (wrapping µs, see `abs_time_us`).
+    let mut last_time_us: Option<u32> = None;
+    let time_origin = perf.time_origin();
 
-    // ── Driver: render-paced loop. Block until the render thread presents a
-    // frame, then catch the fixed-step sim up to elapsed real time and publish
-    // the pose the next frame will read — so the sim steps in phase with vsync,
-    // not against a second free-running clock (see `BodyMotion`) ─────────────
+    // ── Driver: render-paced loop. Block until the render thread starts a
+    // frame, then catch the fixed-step sim up to that frame's time and publish
+    // the steps the next frame will draw (see `BodyMotion`) ─────────────────
     let mut last_frame = motion.frame_tick();
     loop {
         last_frame = motion.wait_frame(last_frame);
-        let now = perf.now();
-        let mut frame = now - last_time;
-        last_time = now;
-        if frame > MAX_FRAME_MS {
-            frame = MAX_FRAME_MS; // a long stall (backgrounded tab) — don't binge-simulate
-        }
-        accumulator += frame;
+        // The frame's time on render's clock; our own (on the same absolute
+        // timeline) only until render has published its first one.
+        let now_us = motion
+            .frame_time_us()
+            .unwrap_or_else(|| abs_time_us(time_origin, perf.now()));
+        let elapsed_ms = match last_time_us.replace(now_us) {
+            // Never negative: a frame time older than the last one is noise.
+            Some(prev) => f64::from(crate::protocol::time_diff_us(now_us, prev).max(0)) / 1000.0,
+            None => 0.0,
+        };
+        // A long stall (backgrounded tab, debugger) — don't binge-simulate.
+        accumulator += elapsed_ms.min(MAX_FRAME_MS);
 
         let mut substeps: u32 = 0;
 
@@ -367,6 +383,15 @@ pub fn start(payload: JsValue) -> Result<(), JsValue> {
             let mut teleported = false;
             tick = tick.wrapping_add(1);
             total_steps = total_steps.wrapping_add(1);
+            // When this step is due: the frame time minus what is left in
+            // the accumulator after it. Computed from the f64 accumulator
+            // every time (a running `+ step` in whole µs would drift ~80 µs/s
+            // against render's display time). The previous step's time is
+            // for teleport snaps, which rewrite it.
+            let left_ms = accumulator - FIXED_DT_MS;
+            let step_time_us = now_us.wrapping_sub((left_ms * 1000.0).round() as u32);
+            let prev_time_us =
+                now_us.wrapping_sub(((left_ms + FIXED_DT_MS) * 1000.0).round() as u32);
 
             // ── Pending click-drop? Create the ball before stepping ────────
             // (Render unprojected the click and filed the request; if several
@@ -408,6 +433,8 @@ pub fn start(payload: JsValue) -> Result<(), JsValue> {
                     // when it sees it.
                     balls.slot(index).publish_snap(
                         total_steps,
+                        step_time_us,
+                        prev_time_us,
                         [spawn_at.x, spawn_at.y, spawn_at.z],
                         [0.0, 0.0, 0.0, 1.0],
                     );
@@ -422,7 +449,7 @@ pub fn start(payload: JsValue) -> Result<(), JsValue> {
 
             // Apply input before stepping (polled from the shared block).
             unsafe {
-                let held = input.held();
+                let held = input.take_held();
                 let mut dir = v3(0.0, 0.0, 0.0);
                 if held & HELD_FORWARD != 0 {
                     dir.z -= 1.0;
@@ -654,9 +681,17 @@ pub fn start(payload: JsValue) -> Result<(), JsValue> {
                     let curr_p = [p.x, p.y, p.z];
                     let curr_q = [q.v.x, q.v.y, q.v.z, q.s];
                     if ball_teleported {
-                        balls.slot(i).publish_snap(total_steps, curr_p, curr_q);
+                        balls.slot(i).publish_snap(
+                            total_steps,
+                            step_time_us,
+                            prev_time_us,
+                            curr_p,
+                            curr_q,
+                        );
                     } else {
-                        balls.slot(i).publish(total_steps, curr_p, curr_q);
+                        balls
+                            .slot(i)
+                            .publish(total_steps, step_time_us, curr_p, curr_q);
                     }
                 }
             }
@@ -664,9 +699,11 @@ pub fn start(payload: JsValue) -> Result<(), JsValue> {
             // Publish the player's pose for THIS step (snap on teleport so the
             // render thread never interpolates across the respawn).
             if teleported {
-                motion.publish_snap(total_steps, pos, quat);
+                motion
+                    .ring()
+                    .publish_snap(total_steps, step_time_us, prev_time_us, pos, quat);
             } else {
-                motion.publish(total_steps, pos, quat);
+                motion.ring().publish(total_steps, step_time_us, pos, quat);
             }
             motion.add_step_work_us(((perf.now() - body_t0) * 1000.0).max(0.0) as u32);
 

@@ -28,6 +28,88 @@ renderer, **physics colliders derived from the scene's own collider nodes**,
 with physics on its own threads feeding transforms through shared memory and
 audio cues back to the main thread.
 
+## Threading at a glance
+
+**Who spawns whom, and what crosses by message.** Main spawns every Rust
+worker (the physics worker blocks on a futex for its whole life, so it asks
+main to spawn its task pool). Dotted arrows are `postMessage` — cold paths
+only, nothing per frame.
+
+```mermaid
+flowchart TB
+    MAIN["Main thread<br/>DOM · input · stats panel<br/>WebAudio Player"]
+    RENDER["Render worker<br/>awsm-renderer on an OffscreenCanvas<br/>requestAnimationFrame loop"]
+    PHYS["Physics worker<br/>Box3D world · fixed 240 Hz step<br/>blocks on the frame-tick futex"]
+    POOL["Task-pool workers ×N<br/>N = cores − 3, clamped to 0..4<br/>run Box3D solver tasks"]
+    AUDIO["Audio rendering thread<br/>roll + clack AudioWorklets<br/>their own small wasm instances"]
+    BASIS["Basis worker · plain JS<br/>KTX2 texture transcode at load<br/>its own memory"]
+
+    MAIN -- "1 · spawns, transfers the OffscreenCanvas" --> RENDER
+    MAIN -- "2 · spawns with PhysicsInit" --> PHYS
+    MAIN -- "3 · spawns with the TaskPool address" --> POOL
+    RENDER -. "RenderMsg: Progress, GpuInfo, PhysicsInit, Ready, AA compile, Error" .-> MAIN
+    MAIN -. "DropMsg, CameraMsg, ResizeMsg, QualityMsg" .-> RENDER
+    PHYS -. "SpawnTaskWorkers, AudioMsg cues" .-> MAIN
+    MAIN -- "voices + live AudioParams" --> AUDIO
+    RENDER -. "spawned on demand, buffers transferred" .-> BASIS
+```
+
+**What is shared where.** Main, render, physics and the task pool are the
+*same* wasm module attached to *one* `WebAssembly.Memory`, so a plain Rust
+struct is visible to all of them at the same address. Thick arrows are
+shared-memory reads/writes (atomics, no messages); each block is allocated
+once and leaked for the session, and only its address is ever posted.
+
+```mermaid
+flowchart LR
+    MAIN["Main thread"]
+    PHYS["Physics worker"]
+    POOL["Task-pool workers ×N"]
+    RENDER["Render worker"]
+
+    subgraph MEM["One shared WebAssembly.Memory · Rust and Box3D C in one wasm module"]
+        direction TB
+        INPUT[("InputState<br/>held keys · jump · fling · camera yaw")]
+        TP[("TaskPool<br/>task slots · semaphore futex · claim counters")]
+        WORLD[("Box3D world + solver state")]
+        MOTION[("BodyMotion<br/>player PoseRing · frame-tick futex · timing counters")]
+        BALLS[("BallMotions<br/>drop request · one PoseRing per dropped ball")]
+        ARENA[("Renderer transform arena<br/>one 64-byte matrix slot per body")]
+    end
+
+    MAIN == "writes on key / touch events" ==> INPUT
+    INPUT == "polled every step" ==> PHYS
+    PHYS == "enqueues solver tasks" ==> TP
+    TP == "CAS-claimed" ==> POOL
+    PHYS == "b3World_Step" ==> WORLD
+    POOL == "run solver tasks on it" ==> WORLD
+    PHYS == "publishes a pose every step" ==> MOTION
+    PHYS == "publishes poses, bumps count" ==> BALLS
+    MOTION == "sampled every frame" ==> RENDER
+    BALLS == "sampled every frame" ==> RENDER
+    RENDER == "frame-tick bump wakes physics" ==> MOTION
+    RENDER == "drop request" ==> BALLS
+    RENDER == "interpolated matrix per body" ==> ARENA
+```
+
+| Shared block | Allocated by | Written by | Read by | Synchronization |
+|---|---|---|---|---|
+| `InputState` | main | main | physics, once per step | relaxed atomics; seq counters edge-detect jumps / flings |
+| `BodyMotion` — pose ring | render | physics, every step | render, every frame | per-slot seqlock tagged with its step |
+| `BodyMotion` — frame tick | render | render, once per presented frame | physics blocks on it | futex (`memory.atomic.wait32` / `notify`) |
+| `BodyMotion` — timing counters | render | render + physics | main's 1 Hz stats sampler | relaxed atomics |
+| `BallMotions` — drop request | render | render (from main's `DropMsg`) | physics, once per step | seq counter, Release / Acquire |
+| `BallMotions` — per-ball pose rings + count | render | physics | render, every frame; main (ball count) | seqlock per slot; count is Release / Acquire |
+| `TaskPool` | physics | physics enqueues; pool workers and physics claim | pool workers; main (claim counters for stats) | CAS on slot status + futex counting semaphore |
+| Box3D world | physics | physics and pool workers, only inside `b3World_Step` | same | Box3D's own task partitioning |
+| Transform arena | render (the renderer) | render only | render (GPU upload) | none needed — single thread |
+
+Not shared: the **audio worklets** run on the browser's audio rendering
+thread as separate small wasm instances, driven only through WebAudio
+params from main; the **Basis worker** is a plain JS worker with its own
+memory. Neither attaches to the shared `WebAssembly.Memory`. Details for all
+of this are in [The threads](#the-threads) below.
+
 ## Run it
 
 ```sh

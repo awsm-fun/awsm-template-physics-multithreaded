@@ -30,6 +30,28 @@ audio cues back to the main thread.
 
 ## Threading at a glance
 
+### What runs where
+
+```mermaid
+flowchart TB
+    MAIN["<b>Main thread</b><br/>UI and DOM<br/>keyboard, pointer and touch input<br/>sound playback (WebAudio)<br/>stats panel"]
+    RENDER["<b>Render worker</b><br/>awsm-renderer (WebGPU)<br/>scene loading<br/>camera<br/>smoothing physics poses for display"]
+    PHYS["<b>Physics worker</b><br/>Box3D simulation at 240 Hz<br/>gameplay: input to forces<br/>collisions to sound cues"]
+    POOL["<b>Task-pool workers, up to 4</b><br/>Box3D solver work in parallel"]
+    AUDIO["<b>Audio thread</b><br/>sound synthesis (AudioWorklets)"]
+    BASIS["<b>Basis worker</b><br/>texture decoding at load"]
+
+    MAIN --> RENDER
+    MAIN --> PHYS
+    PHYS --> POOL
+    MAIN --> AUDIO
+    RENDER --> BASIS
+```
+
+Arrows point from a thread to the threads that work on its behalf.
+
+### In detail
+
 **Who spawns whom, and what crosses by message.** Main spawns every Rust
 worker (the physics worker blocks on a futex for its whole life, so it asks
 main to spawn its task pool). Dotted arrows are `postMessage` — cold paths

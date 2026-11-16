@@ -151,7 +151,10 @@ pub struct BallMotions {
     drop_z: AtomicU32,
     /// Balls created so far (physics-side write, Release after slot init).
     count: AtomicU32,
-    slots: [PoseRing; MAX_BALLS],
+    /// On the heap: `MAX_BALLS` pose rings are about half a megabyte, too big
+    /// to build on a thread's stack and then move. (It is still in the one
+    /// shared wasm memory, so every thread reaches it through `&self`.)
+    slots: Box<[PoseRing]>,
 }
 
 impl BallMotions {
@@ -161,7 +164,9 @@ impl BallMotions {
             drop_x: AtomicU32::new(0),
             drop_z: AtomicU32::new(0),
             count: AtomicU32::new(0),
-            slots: core::array::from_fn(|_| PoseRing::new([0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0])),
+            slots: (0..MAX_BALLS)
+                .map(|_| PoseRing::new([0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]))
+                .collect(),
         }
     }
 

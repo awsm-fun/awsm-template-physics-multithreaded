@@ -335,6 +335,16 @@ the workers already maintain (frame tick, step count, per-worker task-pool
 claims, ball count) into fps / steps-per-second / tasks-per-second rates. No
 messages, no extra instrumentation on any hot path.
 
+Two lines are about frame pacing. **display** is the refresh rate of the
+browser's frame clock for the window, measured by a `requestAnimationFrame`
+loop on the (light) main thread, since no web API reports it
+(`packages/frontend/src/refresh.rs`). **missed** counts display refreshes that
+went by with no new frame (the screen showed the previous frame again), per
+second and in total: the render thread adds up the time between its presented
+frames (`BodyMotion::frame_span_us`), and a span of `S` ms at refresh period
+`P` should hold `S / P` frames. A nonzero rate means the renderer is not
+keeping up with the display; lower the resolution or the anti-aliasing.
+
 ## The threaded build profile (why it's different)
 
 A normal wasm build has a private, non-shared linear memory — workers can't share

@@ -568,6 +568,9 @@ async fn run(
     // the first frame. See `RafCell`: frame time must come from the vsync
     // grid, not from when the callback happened to run.
     let mut last_vsync: Option<f64> = None;
+    // The previous PRESENTED frame's vsync timestamp, for the stats panel's
+    // missed-frame count (`BodyMotion::add_frame_span_us`).
+    let mut last_presented: Option<f64> = None;
     // Low-passed re-anchor error: `latest` carries the wake wobble, and
     // applying the raw error each frame would leak 5% of that wobble into the
     // display. The drift this corrects is DC; smooth the noise away first.
@@ -800,6 +803,12 @@ async fn run(
             }
         }
 
+        // The span since the previous presented frame, for the missed-frame
+        // count — added before the tick, so a reader that sees this frame's
+        // tick also sees its span.
+        if let Some(prev) = last_presented.replace(vsync_ms) {
+            motion.add_frame_span_us(((vsync_ms - prev) * 1000.0).round().max(0.0) as u64 as u32);
+        }
         // Frame presented — wake physics to advance the sim for the next one, so
         // its step cadence stays locked to vsync (see `BodyMotion::bump_frame`).
         motion.bump_frame();

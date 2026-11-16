@@ -27,6 +27,7 @@ pub mod main_thread;
 pub mod physics_tasks;
 pub mod physics_thread;
 pub mod protocol;
+pub mod refresh;
 pub mod render_thread;
 
 use wasm_bindgen::prelude::*;

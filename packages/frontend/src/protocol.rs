@@ -376,6 +376,13 @@ pub struct BodyMotion {
     /// readback is single-buffered, so this counts fewer than `frame_tick`.
     /// Stays 0 on a device without `timestamp-query`.
     gpu_samples: AtomicU32,
+    /// Accumulated time between presented frames, in MICROSECONDS (wrapping):
+    /// each frame adds the gap between its rAF timestamp and the previous
+    /// presented frame's. Diffed with `frame_tick`, the stats panel gets the
+    /// span a window's frames covered, and so how many display refreshes went
+    /// by with no new frame (see `refresh::Missed`). Added BEFORE the frame's
+    /// tick bump.
+    frame_span_us: AtomicU32,
 }
 
 impl BodyMotion {
@@ -390,6 +397,7 @@ impl BodyMotion {
             display_lag_bits: AtomicU32::new(0),
             gpu_total_us: AtomicU32::new(0),
             gpu_samples: AtomicU32::new(0),
+            frame_span_us: AtomicU32::new(0),
         }
     }
 
@@ -441,6 +449,17 @@ impl BodyMotion {
     /// divide by the `frame_tick` delta for avg time per frame.
     pub fn frame_work_us(&self) -> u32 {
         self.frame_work_us.load(Ordering::Relaxed)
+    }
+
+    /// Render side: add the interval (µs) since the previous presented frame.
+    pub fn add_frame_span_us(&self, us: u32) {
+        self.frame_span_us.fetch_add(us, Ordering::Relaxed);
+    }
+
+    /// Accumulated time between presented frames (µs, wrapping) — diff two
+    /// reads for the span a window's frames covered.
+    pub fn frame_span_us(&self) -> u32 {
+        self.frame_span_us.load(Ordering::Relaxed)
     }
 
     /// Physics side: add one fixed step's CPU work time (µs) to the total.

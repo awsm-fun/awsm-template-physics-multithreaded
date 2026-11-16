@@ -345,6 +345,9 @@ struct StatsSample {
     step_work_us: u32,
     /// Renderer GPU frame-time totals at sample time: (µs, samples), wrapping.
     gpu: (u32, u32),
+    /// Accumulated time between presented frames (µs, wrapping) — see
+    /// `BodyMotion::frame_span_us`.
+    frame_span_us: u32,
     /// Per-executor accumulated task CPU µs (index 0 = the physics thread).
     task_us: Vec<u32>,
 }
@@ -847,6 +850,11 @@ fn setup(
     // physics worker starts polling once spawned. A keypress also starts the audio
     // (the required user gesture).
     install_keyboard(&window, input, audio.clone())?;
+    // Ask for keyboard focus up front, so W/A/S/D work without a click first.
+    // At the top level this is a no-op; in a cross-origin iframe the browser
+    // only allows it once the parent has focused the frame (the awsm.fun
+    // shell does), and otherwise the first press on the canvas does it.
+    let _ = window.focus();
 
     // Holds the render worker once spawned, so the message handler (installed
     // as that worker's `onmessage`, hence built before it exists) can post the
@@ -1285,8 +1293,13 @@ fn install_pointer(
     // pointerdown on the canvas: the RIGHT button begins an orbit drag (left
     // stays the drop-a-ball click); a touch begins a possible swipe. Any
     // button is a user gesture → start audio.
+    let focus_window = window.clone();
     let down = Closure::<dyn FnMut(web_sys::PointerEvent)>::new(
         clone!(dragging, audio, swipe => move |e: web_sys::PointerEvent| {
+            // Keyboard focus to this page. On awsm.fun it runs inside an
+            // iframe, and keys go to whichever frame has focus: a press on the
+            // canvas must bring W/A/S/D here, not leave them with the parent.
+            let _ = focus_window.focus();
             if e.button() == 2 {
                 dragging.set(true);
             }
@@ -1523,9 +1536,18 @@ const STATS_WARMUP_FRAMES: u32 = 60;
 /// rAF doesn't run at all) is never turned into a bogus rate. Counting only
 /// begins `STATS_WARMUP_FRAMES` presented frames after render's `Ready` — see
 /// that constant for why boot samples are discarded. What's shown:
+/// - display: the refresh rate of the browser's frame clock for this window,
+///   measured by a rAF loop on the main thread (see `refresh`) — no web API
+///   reports the screen's rate directly,
 /// - render: presented frames/s (the `BodyMotion` frame-tick). NOTE this is
 ///   real presented fps, so it's vsync-capped — 60 on a 60 Hz display, 120 on
 ///   a 120 Hz one; steady is the goal, not monitor-independent,
+/// - missed: display refreshes that went by with no new frame (the display
+///   showed the previous one again), per second over the latest window and in
+///   total — from the span the presented frames covered
+///   (`BodyMotion::frame_span_us`) over the measured refresh period. Nonzero
+///   means the renderer is not keeping up with the display: lower the
+///   resolution or the anti-aliasing,
 /// - gpu time: avg whole-frame GPU ms (the renderer's timestamp-query span,
 ///   published via `BodyMotion::gpu_totals`) — THE number that says whether a
 ///   frame can make vsync: a 120 Hz display allows 8.3 ms. `n/a` when the
@@ -1558,6 +1580,10 @@ fn install_stats(
     let perf = window
         .performance()
         .ok_or_else(|| JsValue::from_str("no performance"))?;
+    // The display's refresh period, measured by a rAF loop of the main
+    // thread's own (see `refresh`), and the missed-frame count against it.
+    let refresh = crate::refresh::install(window)?;
+    let mut missed = crate::refresh::Missed::default();
 
     // The previous sample. `None` forces a re-seed — at startup, and whenever
     // the tab becomes visible again (shared with the visibility handler).
@@ -1609,6 +1635,12 @@ fn install_stats(
         });
         let (frame, step, frame_work_us, step_work_us, sync_err, lag) =
             motion_counts.unwrap_or((0, 0, 0, 0, 0.0, 0.0));
+        // Read AFTER the frame tick: render adds a frame's span before bumping
+        // its tick, so this span covers at least the frames counted above.
+        let frame_span_us = refs
+            .motion
+            .map(|addr| unsafe { &*(addr as *const BodyMotion) }.frame_span_us())
+            .unwrap_or(0);
         let gpu_totals = refs
             .motion
             .map(|addr| unsafe { &*(addr as *const BodyMotion) }.gpu_totals())
@@ -1627,6 +1659,7 @@ fn install_stats(
             frame_work_us,
             step_work_us,
             gpu: gpu_totals,
+            frame_span_us,
             task_us: task_us.clone(),
         });
 
@@ -1636,6 +1669,7 @@ fn install_stats(
             frame_work_ema = None;
             step_work_ema = None;
             gpu_ema = None;
+            missed.reset();
             stats.set(StatsText {
                 head: "workers\n  main          ui · audio · input\n  render        \
                        starting…\n  physics       starting…"
@@ -1672,6 +1706,13 @@ fn install_stats(
 
         let frames = frame.wrapping_sub(prev.frame);
         let steps = step.wrapping_sub(prev.step);
+        let refresh = refresh.borrow();
+        missed.window(
+            frames,
+            frame_span_us.wrapping_sub(prev.frame_span_us) as f64 / 1000.0,
+            now - prev.t,
+            refresh.period_ms(),
+        );
         let fps = frames as f64 / dt;
         let sps = steps as f64 / dt;
         let f = fps_ema.get_or_insert(fps);
@@ -1712,9 +1753,12 @@ fn install_stats(
         };
 
         let head = format!(
-            "workers\n  main          ui · audio · input\n  render        {:.0} fps\n  \
-             gpu time      {}\n  cpu time      {}\n  physics time  {}\n  physics       {:.0} steps/s\n",
+            "workers\n  main          ui · audio · input\n  display       {}\n  render        \
+             {:.0} fps\n  missed        {}\n  gpu time      {}\n  cpu time      {}\n  \
+             physics time  {}\n  physics       {:.0} steps/s\n",
+            refresh.line(),
             *f,
+            missed.line(),
             gpu_line,
             cpu(frame_work_ema, 1),
             cpu(step_work_ema, 2),

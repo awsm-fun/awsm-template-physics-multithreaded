@@ -956,9 +956,9 @@ fn show_budget(
         let headroom = budget - largest;
         over = headroom < 0.0;
         if over {
-            headline += &format!(" · over by {} ms", ms_1dp(-headroom));
+            headline += &format!(" · over by {:.1} ms", -headroom);
         } else {
-            headline += &format!(" · headroom {} ms", ms_1dp(headroom));
+            headline += &format!(" · headroom {headroom:.1} ms");
         }
     }
     let mut rows: Vec<Row> = lanes
@@ -968,7 +968,7 @@ fn show_budget(
     if let (Some(renderer), Some(gpu)) = (figures.frame_work, figures.gpu) {
         rows.push(row(
             "latency (renderer + GPU), reference only",
-            format!("{} ms", ms_1dp(renderer + gpu)),
+            format!("{:.1} ms", renderer + gpu),
         ));
     }
     panel.set(Group::Budget, headline, rows, over);

@@ -3,6 +3,8 @@
 //! One group per thread, so every number sits under the thread that spent
 //! it, and every number says its unit and what it is per:
 //!
+//! - `frame budget`: the refresh period, and each thread's and the GPU's
+//!   time per drawn frame against it.
 //! - `display`: the refresh rate of the browser's frame clock (measured here,
 //!   see `refresh`), the frames the renderer presented per second, and the
 //!   refreshes that went by with no new frame.
@@ -10,7 +12,8 @@
 //!   without them). Its rows are the passes; on GPUs that run passes
 //!   overlapped (Apple's) they add up to more than the frame, which is
 //!   expected, not a bug.
-//! - `renderer (render worker)`: the render worker's CPU time per frame.
+//! - `renderer (render worker)`: the render worker's CPU time per frame;
+//!   expanded, our phases and awsm-renderer's CPU scopes inside `render()`.
 //! - `physics (Box3D, physics worker + N pool threads)`: the physics
 //!   worker's CPU time per fixed step (including the time it waits on the
 //!   pool inside a step), steps per second, frames drawn before physics had
@@ -64,12 +67,22 @@ const LATE_WINDOWS: u32 = 3;
 /// 2–3× the settled cost. Counted in frames, so a stalled renderer keeps
 /// waiting instead of "warming up" through the stall.
 const WARMUP_FRAMES: u32 = 60;
-/// The renderer phase whose time its per-pass rows break down.
+/// The renderer phase whose time its scope rows break down.
 const RENDER_PHASE: &str = "render (encode + submit)";
+/// Scopes under this mean (ms per frame) are folded into one line.
+const FOLD_BELOW_MS: f64 = 0.001;
+/// The renderer's scope kinds, in the panel's order, with their labels.
+const SCOPE_GROUPS: [(TimingKind, &str); 4] = [
+    (TimingKind::RendererPrep, "prepare"),
+    (TimingKind::RendererPass, "passes"),
+    (TimingKind::RendererSubmit, "submit"),
+    (TimingKind::RendererHook, "hooks"),
+];
 
 /// The groups, top to bottom.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Group {
+    Budget,
     Display,
     Gpu,
     Renderer,
@@ -78,7 +91,8 @@ pub enum Group {
 }
 
 impl Group {
-    const ALL: [Group; 5] = [
+    const ALL: [Group; 6] = [
+        Group::Budget,
         Group::Display,
         Group::Gpu,
         Group::Renderer,
@@ -89,6 +103,7 @@ impl Group {
     /// Storage / element id.
     fn id(self) -> &'static str {
         match self {
+            Group::Budget => "budget",
             Group::Display => "display",
             Group::Gpu => "gpu",
             Group::Renderer => "renderer",
@@ -99,6 +114,7 @@ impl Group {
 
     fn label(self) -> &'static str {
         match self {
+            Group::Budget => "frame budget",
             Group::Display => "display",
             Group::Gpu => "GPU",
             Group::Renderer => "renderer (render worker)",
@@ -113,7 +129,7 @@ impl Group {
             Group::Gpu => DETAIL_GPU,
             Group::Renderer => DETAIL_RENDERER,
             Group::Physics => DETAIL_PHYSICS,
-            Group::Display | Group::Page => 0,
+            Group::Budget | Group::Display | Group::Page => 0,
         }
     }
 }
@@ -152,6 +168,36 @@ fn per_step(ms: f64) -> String {
     format!("{} / step", duration(ms))
 }
 
+/// Milliseconds with one decimal, for the frame budget: `<0.1` for a
+/// nonzero time that would print as 0.0.
+fn ms_1dp(ms: f64) -> String {
+    if ms > 0.0 && ms < 0.05 {
+        "<0.1".to_string()
+    } else {
+        format!("{ms:.1}")
+    }
+}
+
+/// A frame budget row: `7.2 / 16.7 ms (43%)`.
+fn budget_share(used_ms: f64, budget_ms: f64) -> String {
+    let pct = used_ms / budget_ms * 100.0;
+    let pct = if pct > 0.0 && pct < 1.0 {
+        "<1%".to_string()
+    } else {
+        format!("{pct:.0}%")
+    };
+    format!("{} / {budget_ms:.1} ms ({pct})", ms_1dp(used_ms))
+}
+
+/// The physics group's label, which names the pool's size once known.
+fn physics_label(pool: Option<(usize, u32)>) -> String {
+    match pool {
+        Some((_, 1)) => "physics (Box3D, physics worker + 1 pool thread)".to_string(),
+        Some((_, n)) => format!("physics (Box3D, physics worker + {n} pool threads)"),
+        None => Group::Physics.label().to_string(),
+    }
+}
+
 fn smooth(ema: Option<f64>, value: f64) -> f64 {
     match ema {
         Some(e) => e + (value - e) * EMA_ALPHA,
@@ -159,13 +205,13 @@ fn smooth(ema: Option<f64>, value: f64) -> f64 {
     }
 }
 
-/// One row of a group: label left, value right. `nested` indents it under
-/// the row above (a breakdown of it); `bad` turns it red.
+/// One row of a group: label left, value right. `depth` indents it under
+/// the row above (a breakdown of it), up to two levels; `bad` turns it red.
 #[derive(Clone, PartialEq)]
 struct Row {
     label: String,
     value: String,
-    nested: bool,
+    depth: u8,
     bad: bool,
 }
 
@@ -173,14 +219,19 @@ fn row(label: impl Into<String>, value: impl Into<String>) -> Row {
     Row {
         label: label.into(),
         value: value.into(),
-        nested: false,
+        depth: 0,
         bad: false,
     }
 }
 
 impl Row {
     fn nested(mut self) -> Self {
-        self.nested = true;
+        self.depth = 1;
+        self
+    }
+
+    fn nested_2(mut self) -> Self {
+        self.depth = 2;
         self
     }
 
@@ -332,7 +383,8 @@ impl Panel {
                         .children_signal_vec(view.rows.signal_vec_cloned().map(|row| {
                             html!("div", {
                                 .class("stats-row")
-                                .apply_if(row.nested, |dom| dom.class("stats-nested"))
+                                .apply_if(row.depth == 1, |dom| dom.class("stats-nested"))
+                                .apply_if(row.depth == 2, |dom| dom.class("stats-nested-2"))
                                 .apply_if(row.bad, |dom| dom.class("stats-bad"))
                                 .child(html!("span", { .text(&row.label) }))
                                 .child(html!("span", { .text(&row.value) }))
@@ -433,6 +485,8 @@ struct Figures {
     steps: Option<f64>,
     frame_work: Option<f64>,
     step_work: Option<f64>,
+    /// The physics worker's step time per drawn frame.
+    physics_per_frame: Option<f64>,
     gpu: Option<f64>,
     /// Trusted windows in a row with no GPU sample: after a few, the device
     /// evidently has no `timestamp-query`.
@@ -519,14 +573,7 @@ pub fn install_stats(
         if let Some(motion) = motion {
             motion.set_detail(panel.detail());
         }
-        panel.set_label(
-            Group::Physics,
-            match refs.pool {
-                Some((_, 1)) => "physics (Box3D, physics worker + 1 pool thread)".to_string(),
-                Some((_, n)) => format!("physics (Box3D, physics worker + {n} pool threads)"),
-                None => Group::Physics.label().to_string(),
-            },
-        );
+        panel.set_label(Group::Physics, physics_label(refs.pool));
         let page_work = page.take();
         let timings: HashMap<(TimingKind, String), (f64, f64)> = render_timings
             .borrow()
@@ -635,6 +682,11 @@ fn sample_window(
             figures.frame_work,
             us as f64 / frames as f64 / 1000.0,
         ));
+        let us = current.step_work_us.wrapping_sub(previous.step_work_us);
+        figures.physics_per_frame = Some(smooth(
+            figures.physics_per_frame,
+            us as f64 / frames as f64 / 1000.0,
+        ));
     }
     if steps > 0 {
         let us = current.step_work_us.wrapping_sub(previous.step_work_us);
@@ -700,14 +752,14 @@ fn sample_window(
         _ => figures.step_phases = Default::default(),
     }
 
-    // The renderer's breakdowns, the same way. A GPU pass whose total did
-    // not move did not run (switched off), so it drops out too.
+    // The renderer's breakdowns, the same way. A pass or scope whose total
+    // did not move did not run (switched off), so it drops out too.
     let mut means = HashMap::new();
     for (key, &(total_ms, count)) in timings {
         let Some(&(total0, count0)) = previous_timings.get(key) else {
             continue;
         };
-        if count > count0 && (key.0 != TimingKind::GpuPass || total_ms > total0) {
+        if count > count0 && (key.0 == TimingKind::RendererPhase || total_ms > total0) {
             let ms = (total_ms - total0) / (count - count0);
             means.insert(key.clone(), smooth(figures.timings.get(key).copied(), ms));
         }
@@ -724,6 +776,8 @@ fn show(
     balls: Option<usize>,
     pool: Option<(usize, u32)>,
 ) {
+    show_budget(panel, figures, refresh.period_ms(), pool);
+
     let fps = figures.fps.unwrap_or(0.0);
     let hz = refresh.line();
     panel.set(
@@ -762,33 +816,47 @@ fn show(
         .collect();
     panel.set(Group::Gpu, gpu, gpu_rows, false);
 
-    // The renderer's phases in their fixed order, with its CPU time inside
-    // each pass listed under the phase that encodes them.
-    let passes = entries(TimingKind::RendererPass);
+    // Our phases in the order they run, with awsm-renderer's scopes inside
+    // render() grouped by kind under the render phase.
     let mut renderer_rows = Vec::new();
     for name in crate::render_profile::PHASE_NAMES {
         let Some(ms) = figures.timing(TimingKind::RendererPhase, name) else {
             continue;
         };
         renderer_rows.push(row(name, per_frame(ms)));
-        if name != RENDER_PHASE || passes.is_empty() {
+        if name != RENDER_PHASE {
             continue;
         }
-        for &(pass, pass_ms) in &passes {
-            renderer_rows.push(row(pass, per_frame(pass_ms)).nested());
+        let mut in_scopes = None;
+        for (kind, label) in SCOPE_GROUPS {
+            let scopes = entries(kind);
+            if scopes.is_empty() {
+                continue;
+            }
+            let sum: f64 = scopes.iter().map(|(_, ms)| ms).sum();
+            *in_scopes.get_or_insert(0.0) += sum;
+            renderer_rows.push(row(label, per_frame(sum)).nested());
+            let (shown, folded): (Vec<_>, Vec<_>) =
+                scopes.into_iter().partition(|&(_, ms)| ms >= FOLD_BELOW_MS);
+            for (scope, scope_ms) in shown {
+                renderer_rows.push(row(scope, per_frame(scope_ms)).nested_2());
+            }
+            if !folded.is_empty() {
+                let folded_ms: f64 = folded.iter().map(|(_, ms)| ms).sum();
+                renderer_rows.push(
+                    row(
+                        format!("{} more under 1 µs", folded.len()),
+                        per_frame(folded_ms),
+                    )
+                    .nested_2(),
+                );
+            }
         }
-        // What render() spends that no pass accounts for: per-frame uploads,
-        // culling, bookkeeping.
-        let in_passes: f64 = passes.iter().map(|(_, ms)| ms).sum();
-        renderer_rows
-            .push(row("outside the passes", per_frame((ms - in_passes).max(0.0))).nested());
-    }
-    // The per-pass timers are costly, so the renderer runs them on some
-    // frames only and reports what they add to the average frame: the one
-    // part of the headline that is there because the group is open.
-    let overhead = crate::render_profile::OVERHEAD_NAME;
-    if let Some(ms) = figures.timing(TimingKind::RendererOverhead, overhead) {
-        renderer_rows.push(row(format!("{overhead} (only while open)"), per_frame(ms)));
+        // The glue between the scopes.
+        if let Some(in_scopes) = in_scopes {
+            renderer_rows
+                .push(row("outside the scopes", per_frame((ms - in_scopes).max(0.0))).nested());
+        }
     }
     panel.set(
         Group::Renderer,
@@ -854,4 +922,54 @@ fn show(
         page_rows,
         false,
     );
+}
+
+/// The `frame budget` group: one lane per thread plus the GPU, each its time
+/// per drawn frame, against the refresh period. CPU and GPU work run in
+/// parallel, so each must fit the budget on its own; they do not add up,
+/// except when the CPU waits on the GPU, which shows as missed frames.
+fn show_budget(
+    panel: &Panel,
+    figures: &Figures,
+    period_ms: Option<f64>,
+    pool: Option<(usize, u32)>,
+) {
+    let Some(budget) = period_ms else {
+        panel.set(Group::Budget, "measuring…", Vec::new(), false);
+        return;
+    };
+    // The pool threads get no lane: they run in parallel with the physics
+    // worker, inside the step it times (it waits for them there).
+    let lanes: Vec<(String, f64)> = [
+        (Group::Gpu.label().to_string(), figures.gpu),
+        (Group::Renderer.label().to_string(), figures.frame_work),
+        (physics_label(pool), figures.physics_per_frame),
+        (Group::Page.label().to_string(), figures.page),
+    ]
+    .into_iter()
+    .filter_map(|(label, ms)| Some((label, ms?)))
+    .collect();
+
+    let mut headline = format!("{budget:.1} ms ({:.0} Hz)", 1000.0 / budget);
+    let mut over = false;
+    if let Some(largest) = lanes.iter().map(|(_, ms)| *ms).reduce(f64::max) {
+        let headroom = budget - largest;
+        over = headroom < 0.0;
+        if over {
+            headline += &format!(" · over by {} ms", ms_1dp(-headroom));
+        } else {
+            headline += &format!(" · headroom {} ms", ms_1dp(headroom));
+        }
+    }
+    let mut rows: Vec<Row> = lanes
+        .iter()
+        .map(|(label, ms)| row(label.as_str(), budget_share(*ms, budget)))
+        .collect();
+    if let (Some(renderer), Some(gpu)) = (figures.frame_work, figures.gpu) {
+        rows.push(row(
+            "latency (renderer + GPU), reference only",
+            format!("{} ms", ms_1dp(renderer + gpu)),
+        ));
+    }
+    panel.set(Group::Budget, headline, rows, over);
 }

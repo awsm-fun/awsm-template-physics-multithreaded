@@ -117,8 +117,8 @@ pub fn start(payload: JsValue) -> Result<(), JsValue> {
             // across releases, so a browser that cached an older transcoder
             // (wasm included: the worker carries the query over to it) would
             // otherwise pair it with the new JS. Bump with awsm-renderer.
-            format!("{base}/workers/basis-worker.js?v=0.42.0"),
-            format!("{base}/vendor/basis/basis_transcoder.js?v=0.42.0"),
+            format!("{base}/workers/basis-worker.js?v=0.43.0"),
+            format!("{base}/vendor/basis/basis_transcoder.js?v=0.43.0"),
         ));
     }
     // The desired STARTUP anti-aliasing (main's stored Settings prefs) rides
@@ -188,7 +188,7 @@ async fn run(
         // GPU timing for the Stats panel's GPU group: `Frame` tier =
         // timestamp queries on every pass, folded into one whole-frame span
         // (cheap; silently off without `timestamp-query`). The CPU tier is
-        // `Off` except on the frames `render_profile` samples while asked.
+        // `Off` except while the renderer group is open (`render_profile`).
         .with_logging(awsm_renderer::debug::AwsmRendererLogging {
             gpu: awsm_renderer::debug::TimingTier::Frame,
             ..Default::default()

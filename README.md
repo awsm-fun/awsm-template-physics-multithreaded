@@ -367,6 +367,15 @@ The top-right **Stats** panel (bottom-left **Stats** button;
 every number sits under the thread that spent it, with its unit and its basis
 (`/ frame`, `/ step`, `/ s`):
 
+- **frame budget**: the refresh period (`16.7 ms (60 Hz) · headroom 9.5 ms`,
+  headroom being the budget less the largest lane; `over by …` and red when
+  that is negative) and, expanded, one lane per thread plus the GPU, each its
+  time per drawn frame against the budget: GPU, renderer, physics (its step
+  time divided by the frames drawn; the pool threads run inside that step, so
+  they have no lane of their own) and page. CPU and GPU work run in parallel,
+  so each must fit the budget on its own; they do not add up, except when the
+  CPU waits on the GPU, which shows as missed frames. The last row, renderer
+  CPU plus GPU per frame, is a latency figure for reference only.
 - **display**: the refresh rate of the browser's frame clock, measured by a
   `requestAnimationFrame` loop on the (light) main thread since no web API
   reports it (`packages/frontend/src/refresh.rs`); frames presented per
@@ -380,10 +389,12 @@ every number sits under the thread that spent it, with its unit and its basis
   GPUs passes overlap, so the rows add up to more than the frame: expected.
 - **renderer (render worker)**: the render thread's CPU time per frame;
   expanded, its four phases (read app state + interpolate, set
-  camera, update transforms, render) with awsm-renderer's per-pass CPU time
-  nested under render, then **timing the passes**. The renderer's per-pass
-  CPU timers are expensive in a worker, so they run on one frame in sixteen,
-  and what they add to the average frame is listed as "timing the passes".
+  camera, update transforms, render) with awsm-renderer's CPU scopes nested
+  under render, grouped by `profiling::cpu_scope_kind` into **prepare**
+  (uploads, bind groups, … before the first pass), **passes**, **submit**
+  and **hooks** (when any ran), each listing its scopes slowest first (those
+  under 1 µs folded into one line), then **outside the scopes**: the rest of
+  render.
 - **physics (Box3D, physics worker + N pool threads)**: the physics thread's
   CPU time per fixed step (including waiting on the pool inside the step);
   expanded, steps/s, **late frames** (frames drawn before physics had
@@ -398,11 +409,10 @@ Groups start collapsed and remember their state (`awsm_box3d_mt_stats_open_<id>`
 `?reset` clears it). Headlines are counters the threads keep in shared
 memory anyway, sampled 1×/s by main: no messages, nothing extra on a hot
 path. Expanding a group is what turns on its breakdown: main sets a bit in
-`BodyMotion`, and only then does the render thread time its phases and
-sample awsm-renderer's per-pass CPU timing (`SubFrame` on one frame in
-sixteen, `Off` otherwise and whenever collapsed; the pass names and totals
-come back as a `RenderMsg::Timings` ~4×/s), or the physics thread time its
-step phases.
+`BodyMotion`, and only then does the render thread time its phases and turn
+on awsm-renderer's CPU scopes (`SubFrame` on every frame while open, `Off`
+whenever collapsed; the scope names and totals come back as a
+`RenderMsg::Timings` ~4×/s), or the physics thread time its step phases.
 
 ## The threaded build profile (why it's different)
 

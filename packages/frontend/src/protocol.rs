@@ -970,13 +970,15 @@ pub enum RenderMsg {
 pub enum TimingKind {
     /// One of the render worker's own frame phases.
     RendererPhase,
-    /// awsm-renderer's CPU time inside one pass.
+    /// awsm-renderer's CPU scopes inside `render()`, by
+    /// `profiling::cpu_scope_kind`: before the first pass, one pass, the
+    /// submit, a render hook.
+    RendererPrep,
     RendererPass,
+    RendererSubmit,
+    RendererHook,
     /// The GPU's time for one pass.
     GpuPass,
-    /// What the renderer's sampled per-pass CPU scopes add to the average
-    /// frame (see `render_profile`).
-    RendererOverhead,
 }
 
 /// A running total: `total_ms` over `count` frames. The stats sampler diffs

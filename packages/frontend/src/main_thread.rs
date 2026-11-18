@@ -79,8 +79,10 @@ const DEFAULT_PIXEL_BUDGET: f64 = 2_800_000.0;
 /// one (WebGPU guarantees at least this). Caps the backing store so a huge
 /// display can't ask for a canvas larger than the GPU allows.
 const DEFAULT_MAX_TEX: u32 = 8192;
-/// `localStorage` key for the persisted user choice.
-const RES_STORAGE_KEY: &str = "awsm_res_scale";
+/// `localStorage` key for the persisted user choice. Every experiment is served
+/// from the same origin (awsm.fun), so each app's keys carry its own prefix;
+/// change it when starting a new project from this template.
+const RES_STORAGE_KEY: &str = "awsm_box3d_mt_res_scale";
 
 /// Everything needed to size the canvas backing store: the user's `scale`
 /// fraction, the GPU's texture-dimension cap, and the current CSS size + DPR
@@ -187,13 +189,13 @@ fn post_resize(render: &Worker, st: &ResState) {
 // almost nothing (the renderer itself defaults it off for that reason) and
 // costs an extra full-screen pre-pass. SMAA earns its place as the cheap AA
 // when MSAA is off.
-const AA_STORAGE_KEY: &str = "awsm_aa";
+const AA_STORAGE_KEY: &str = "awsm_box3d_mt_aa";
 /// The pre-0.42 per-toggle keys — migrated to [`AA_STORAGE_KEY`] once, then
 /// cleared (see [`clear_legacy_aa`]).
 const LEGACY_AA_STORAGE_KEYS: [&str; 2] = ["awsm_msaa", "awsm_smaa"];
 /// `localStorage` key for the stats-panel toggle (default OFF — the panel eats
 /// a lot of a phone screen, so it's opt-in via the bottom-left Stats chip).
-const STATS_STORAGE_KEY: &str = "awsm_stats";
+const STATS_STORAGE_KEY: &str = "awsm_box3d_mt_stats";
 /// The anti-aliasing modes the Settings modal offers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AaMode {

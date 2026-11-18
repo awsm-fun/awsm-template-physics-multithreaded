@@ -21,6 +21,7 @@
 //! `+atomics` + `build-std`) and COOP/COEP headers are what make the shared
 //! memory possible — see `Taskfile.yml`, `Trunk.toml`, `rust-toolchain.toml`.
 
+pub mod about;
 pub mod audio;
 pub mod bootstrap;
 pub mod main_thread;

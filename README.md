@@ -405,6 +405,11 @@ every number sits under the thread that spent it, with its unit and its basis
 - **page (main thread)**: this thread's own per-frame work (its camera frame
   loop and the sound cues it plays).
 
+The panel's `what do these mean?` button opens the **About** modal (bottom
+centre) on its **Stats** tab, which explains every group and row in plain
+words; its **About** tab has the controls and a short tour. Both are in
+`packages/frontend/src/about.rs`.
+
 Groups start collapsed and remember their state (`awsm_box3d_mt_stats_open_<id>`;
 `?reset` clears it). Headlines are counters the threads keep in shared
 memory anyway, sampled 1×/s by main: no messages, nothing extra on a hot

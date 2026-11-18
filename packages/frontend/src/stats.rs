@@ -342,13 +342,20 @@ impl Panel {
         }
     }
 
-    /// The panel: per group, a header button (label left, headline right)
-    /// and the rows it shows while expanded.
-    pub fn dom(self: &Rc<Self>) -> Dom {
+    /// The panel: a `what do these mean?` button that calls `on_help`, then
+    /// per group a header button (label left, headline right) and the rows
+    /// it shows while expanded.
+    pub fn dom(self: &Rc<Self>, on_help: impl Fn() + 'static) -> Dom {
         let panel = self.clone();
         html!("div", {
             .class("stats")
             .visible_signal(self.visible.signal())
+            .child(html!("button", {
+                .attr("type", "button")
+                .class("stats-help")
+                .text("what do these mean?")
+                .event(move |_: dominator::events::Click| on_help())
+            }))
             .children(self.groups.iter().enumerate().flat_map(|(index, view)| {
                 let rows_id = format!("stats-rows-{}", view.group.id());
                 [

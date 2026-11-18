@@ -124,6 +124,8 @@ flowchart LR
 | `BodyMotion` — pose ring | render | physics, every step | render, every frame | per-slot seqlock tagged with its step and due time |
 | `BodyMotion` — frame tick + frame time | render | render, at the start of every frame | physics blocks on the tick, steps to the time | futex (`memory.atomic.wait32` / `notify`); time stored before the tick (Release / Acquire) |
 | `BodyMotion` — timing counters | render | render + physics | main's 1 Hz stats sampler | relaxed atomics |
+| `BodyMotion` — Stats detail bits | main | main, when a Stats group is toggled | render + physics, once per frame | relaxed atomic |
+| `BodyMotion` — step-phase totals | render | physics, ~4×/s while asked | main's 1 Hz stats sampler | seqlock |
 | `BallMotions` — drop request | render | render (from main's `DropMsg`) | physics, once per step | seq counter, Release / Acquire |
 | `BallMotions` — per-ball pose rings + count | render | physics | render, every frame; main (ball count) | seqlock per slot; count is Release / Acquire |
 | `TaskPool` | physics | physics enqueues; pool workers and physics claim | pool workers; main (claim counters for stats) | CAS on slot status + futex counting semaphore |
@@ -238,7 +240,7 @@ are on different threads, so that one clock reading has to travel:
    alongside the frame in between. `D` is fixed before the next burst starts,
    so steps written meanwhile can't move what this frame shows. If the burst
    isn't done in time, the newest step is older than `D`: the frame holds it
-   (no extrapolation) and counts as **app late** in the stats.
+   (no extrapolation) and counts as a **late frame** in the Stats panel.
 
 Latency is therefore one frame plus at most one step (4.2 ms at 240 Hz), and
 it does not move. An earlier version instead let physics read its own clock
@@ -358,24 +360,49 @@ bundle itself downloads/compiles — "loading code…"), then streams every load
 phase as it happens: the render worker relays `RenderMsg::Progress` lines for
 device creation, the scene fetch, each `awsm-renderer` loader phase
 (materials/meshes/textures/pipelines), and the GPU commit stats, and main adds
-its own milestones (audio, worker spawns). The top-right stats panel is pure
-shared-memory telemetry — a 1 Hz sampler on the main thread diffs the counters
-the workers already maintain (frame tick, step count, per-worker task-pool
-claims, ball count) into fps / steps-per-second / tasks-per-second rates. No
-messages, no extra instrumentation on any hot path.
+its own milestones (audio, worker spawns).
 
-Two lines are about frame pacing. **display** is the refresh rate of the
-browser's frame clock for the window, measured by a `requestAnimationFrame`
-loop on the (light) main thread, since no web API reports it
-(`packages/frontend/src/refresh.rs`). **missed** counts display refreshes that
-went by with no new frame (the screen showed the previous frame again), per
-second and in total: the render thread adds up the time between its presented
-frames (`BodyMotion::frame_span_us`), and a span of `S` ms at refresh period
-`P` should hold `S / P` frames. A nonzero rate means the renderer is not
-keeping up with the display; lower the resolution or the anti-aliasing.
-**app late** counts frames drawn before physics had finished the burst they
-show (each repeats the previous picture of the world); it turns red when it
-persists for three seconds, meaning the physics thread can't keep up.
+The top-right **Stats** panel (bottom-left **Stats** button;
+`packages/frontend/src/stats.rs`) has one collapsible group per thread, so
+every number sits under the thread that spent it, with its unit and its basis
+(`/ frame`, `/ step`, `/ s`):
+
+- **display**: the refresh rate of the browser's frame clock, measured by a
+  `requestAnimationFrame` loop on the (light) main thread since no web API
+  reports it (`packages/frontend/src/refresh.rs`); frames presented per
+  second; and **missed frames**, refreshes that went by with no new frame
+  (the render thread sums the time between its presented frames,
+  `BodyMotion::frame_span_us`, and a span of `S` ms at refresh period `P`
+  should hold `S / P` frames). Nonzero means the renderer is not keeping up
+  with the display: lower the resolution or the anti-aliasing.
+- **GPU**: GPU time per frame from timestamp queries (`n/a` without
+  `timestamp-query`); expanded, one row per pass, slowest first. On Apple
+  GPUs passes overlap, so the rows add up to more than the frame: expected.
+- **renderer (render worker)**: the render thread's CPU time per frame;
+  expanded, its four phases (read app state + interpolate, update
+  transforms, set camera, render) with awsm-renderer's per-pass CPU time
+  nested under render, then **timing the passes**. The renderer's per-pass
+  CPU timers are expensive in a worker, so they run on one frame in sixteen,
+  and what they add to the average frame is listed as "timing the passes".
+- **physics (Box3D, physics worker + N pool threads)**: the physics thread's
+  CPU time per fixed step (including waiting on the pool inside the step);
+  expanded, steps/s, **late frames** (frames drawn before physics had
+  finished the burst they show; red, on the row and the header, once it
+  persists for three seconds), the step's phases (input + ball drops, Box3D
+  step, contacts + sound cues, publish poses), how the solver's task time
+  split between the physics thread and the pool, and the balls dropped.
+- **page (main thread)**: this thread's own per-frame work (its camera frame
+  loop and the sound cues it plays).
+
+Groups start collapsed and remember their state (`awsm_box3d_mt_stats_open_<id>`;
+`?reset` clears it). Headlines are counters the threads keep in shared
+memory anyway, sampled 1×/s by main: no messages, nothing extra on a hot
+path. Expanding a group is what turns on its breakdown: main sets a bit in
+`BodyMotion`, and only then does the render thread time its phases and
+sample awsm-renderer's per-pass CPU timing (`SubFrame` on one frame in
+sixteen, `Off` otherwise and whenever collapsed; the pass names and totals
+come back as a `RenderMsg::Timings` ~4×/s), or the physics thread time its
+step phases.
 
 ## The threaded build profile (why it's different)
 

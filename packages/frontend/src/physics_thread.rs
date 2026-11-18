@@ -48,8 +48,9 @@ use wasm_bindgen::JsCast;
 use web_sys::js_sys;
 
 use crate::protocol::{
-    abs_time_us, AudioMsg, BallMotions, BodyMotion, ColliderShapeMsg, InputState, PhysicsInit,
-    HELD_BACK, HELD_FORWARD, HELD_LEFT, HELD_RIGHT, POSE_RING, ROLE_FLOOR, ROLE_WALL, SIM_HZ,
+    abs_time_us, time_diff_us, AudioMsg, BallMotions, BodyMotion, ColliderShapeMsg, InputState,
+    PhysicsInit, DETAIL_PHYSICS, HELD_BACK, HELD_FORWARD, HELD_LEFT, HELD_RIGHT, POSE_RING,
+    ROLE_FLOOR, ROLE_WALL, SIM_HZ, STEP_PHASES,
 };
 
 /// Fixed simulation step, derived from the shared [`SIM_HZ`] (the one rate knob).
@@ -128,6 +129,9 @@ const FALL_LIMIT: f32 = -2.0;
 /// in — long settled by then). Deterministic absent input/clicks, so a scalar
 /// (`BOX3D_WASM_SCALAR=1`) and a SIMD build must print identical bits.
 const PARITY_TICK: u32 = (SIM_HZ * 20.0) as u32;
+/// How often the step-phase totals go to the shared block while the Stats
+/// panel asks for them (µs): a few times a second, not per step.
+const PHASES_PUBLISH_US: u32 = 250_000;
 
 const fn v3(x: f32, y: f32, z: f32) -> b3::b3Vec3 {
     b3::b3Vec3 { x, y, z }
@@ -345,6 +349,11 @@ pub fn start(payload: JsValue) -> Result<(), JsValue> {
     // Step-cost telemetry window (avg b3World_Step wall time, logged 1/min).
     let mut step_ms_acc: f64 = 0.0;
     let mut step_ms_count: u32 = 0;
+    // The Stats panel's step phases (`STEP_PHASES`): running totals (ms) and
+    // the steps they cover, timed only while main sets `DETAIL_PHYSICS`.
+    let mut phase_ms = [0.0_f64; STEP_PHASES.len()];
+    let mut phase_steps: u64 = 0;
+    let mut phases_published_us: u32 = 0;
 
     // Fixed-timestep accumulator; every step's pose is published into the
     // shared pose rings, stamped with the time it is due.
@@ -367,11 +376,14 @@ pub fn start(payload: JsValue) -> Result<(), JsValue> {
             .unwrap_or_else(|| abs_time_us(time_origin, perf.now()));
         let elapsed_ms = match last_time_us.replace(now_us) {
             // Never negative: a frame time older than the last one is noise.
-            Some(prev) => f64::from(crate::protocol::time_diff_us(now_us, prev).max(0)) / 1000.0,
+            Some(prev) => f64::from(time_diff_us(now_us, prev).max(0)) / 1000.0,
             None => 0.0,
         };
         // A long stall (backgrounded tab, debugger) — don't binge-simulate.
         accumulator += elapsed_ms.min(MAX_FRAME_MS);
+        // Collapsed, the phases cost nothing: the laps below reuse clock
+        // reads the step makes anyway, plus one more only while this is set.
+        let profiling = motion.detail() & DETAIL_PHYSICS != 0;
 
         let mut substeps: u32 = 0;
 
@@ -529,8 +541,13 @@ pub fn start(payload: JsValue) -> Result<(), JsValue> {
             }
             let step_t0 = perf.now();
             unsafe { b3::b3World_Step(world, FIXED_DT_SECS, SUB_STEPS) };
-            step_ms_acc += perf.now() - step_t0;
+            let step_t1 = perf.now();
+            step_ms_acc += step_t1 - step_t0;
             step_ms_count += 1;
+            if profiling {
+                phase_ms[0] += step_t0 - body_t0;
+                phase_ms[1] += step_t1 - step_t0;
+            }
 
             // Telemetry, ~once/minute at debug: avg b3World_Step wall time
             // over the window (the M6 scalar-vs-SIMD benchmark reads this)
@@ -664,6 +681,14 @@ pub fn start(payload: JsValue) -> Result<(), JsValue> {
                 });
             }
 
+            let cues_t1 = if profiling {
+                let now = perf.now();
+                phase_ms[2] += now - step_t1;
+                now
+            } else {
+                0.0
+            };
+
             // ── Dropped balls: publish this step's pose into their rings ───
             // Same fall-through safety net as the player, snapping back to
             // the ball's own drop point (publish_snap: no teleport sweep).
@@ -705,7 +730,12 @@ pub fn start(payload: JsValue) -> Result<(), JsValue> {
             } else {
                 motion.ring().publish(total_steps, step_time_us, pos, quat);
             }
-            motion.add_step_work_us(((perf.now() - body_t0) * 1000.0).max(0.0) as u32);
+            let body_t1 = perf.now();
+            motion.add_step_work_us(((body_t1 - body_t0) * 1000.0).max(0.0) as u32);
+            if profiling {
+                phase_ms[3] += body_t1 - cues_t1;
+                phase_steps += 1;
+            }
 
             accumulator -= FIXED_DT_MS;
             substeps += 1;
@@ -713,6 +743,12 @@ pub fn start(payload: JsValue) -> Result<(), JsValue> {
 
         if substeps == MAX_SUBSTEPS {
             accumulator = 0.0; // hit the cap — drop the backlog (avoid a spiral)
+        }
+        if profiling
+            && time_diff_us(now_us, phases_published_us).unsigned_abs() >= PHASES_PUBLISH_US
+        {
+            phases_published_us = now_us;
+            motion.set_step_phases(&phase_ms, phase_steps);
         }
     }
 }

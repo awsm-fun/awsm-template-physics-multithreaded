@@ -32,11 +32,11 @@ use web_sys::{
 
 use crate::audio::AudioController;
 use crate::bootstrap::{spawn_shared_worker, spawn_shared_worker_transfer};
-use crate::physics_tasks::TaskPool;
 use crate::protocol::{
-    abs_time_us, AudioMsg, BallMotions, BodyMotion, CameraRing, DropMsg, InputState, OrbitCamera,
-    PhysicsMsg, QualityMsg, RenderMsg, ResizeMsg, HELD_BACK, HELD_FORWARD, HELD_LEFT, HELD_RIGHT,
+    abs_time_us, AudioMsg, CameraRing, DropMsg, InputState, OrbitCamera, PhysicsMsg, QualityMsg,
+    RenderMsg, ResizeMsg, TimingTotal, HELD_BACK, HELD_FORWARD, HELD_LEFT, HELD_RIGHT,
 };
+use crate::stats::{install_stats, PageWork, Panel, StatsRefs};
 
 /// Shared, lazily-loaded audio. `None` until the export finishes loading; stays
 /// silent until a user gesture starts it (browser autoplay policy).
@@ -148,7 +148,7 @@ fn initial_auto_cap(window: &web_sys::Window) -> f64 {
 /// that seeds lower graphics defaults: the resolution scale starts at
 /// [`COARSE_START_SCALE`] and MSAA starts off. Only DEFAULTS — a stored user
 /// choice always wins.
-fn coarse_pointer(window: &web_sys::Window) -> bool {
+pub(crate) fn coarse_pointer(window: &web_sys::Window) -> bool {
     window
         .match_media("(pointer: coarse)")
         .ok()
@@ -195,7 +195,8 @@ const AA_STORAGE_KEY: &str = "awsm_box3d_mt_aa";
 const LEGACY_AA_STORAGE_KEYS: [&str; 2] = ["awsm_msaa", "awsm_smaa"];
 /// `localStorage` key for the stats-panel toggle (default OFF — the panel eats
 /// a lot of a phone screen, so it's opt-in via the bottom-left Stats chip).
-const STATS_STORAGE_KEY: &str = "awsm_box3d_mt_stats";
+/// Each panel group's open state is stored under it too (see `stats`).
+pub(crate) const STATS_STORAGE_KEY: &str = "awsm_box3d_mt_stats";
 /// The anti-aliasing modes the Settings modal offers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AaMode {
@@ -291,7 +292,7 @@ fn clear_legacy_aa(window: &web_sys::Window) {
 }
 
 /// Read a persisted boolean setting (`"1"`/`"0"`), `None` if unset.
-fn stored_bool(window: &web_sys::Window, key: &str) -> Option<bool> {
+pub(crate) fn stored_bool(window: &web_sys::Window, key: &str) -> Option<bool> {
     let ls = window.local_storage().ok().flatten()?;
     match ls.get_item(key).ok().flatten()?.as_str() {
         "1" => Some(true),
@@ -301,7 +302,7 @@ fn stored_bool(window: &web_sys::Window, key: &str) -> Option<bool> {
 }
 
 /// Persist a boolean setting.
-fn store_bool(window: &web_sys::Window, key: &str, val: bool) {
+pub(crate) fn store_bool(window: &web_sys::Window, key: &str, val: bool) {
     if let Ok(Some(ls)) = window.local_storage() {
         let _ = ls.set_item(key, if val { "1" } else { "0" });
     }
@@ -315,52 +316,8 @@ fn post_quality(render: &Worker, msaa: bool, smaa: bool) {
     }
 }
 
-/// Shared-memory addresses the stats panel samples (filled in as the workers
-/// come up): the player's [`BodyMotion`] (frame tick + step count), the
-/// [`BallMotions`] block (dropped-ball count), and the task pool + its worker
-/// count. All are leaked-for-the-session blocks, so raw addresses are stable.
-#[derive(Default, Clone, Copy)]
-struct StatsRefs {
-    motion: Option<usize>,
-    balls: Option<usize>,
-    pool: Option<(usize, u32)>,
-}
-
-/// The stats panel's renderable state: plain text above and below the
-/// "app late" line, plus that line itself with its health flag — split out so
-/// the DOM can color just that line red when physics is persistently late
-/// (see `install_stats` for what "bad" means).
-#[derive(Clone, Default)]
-struct StatsText {
-    head: String,
-    sync: String,
-    bad: bool,
-    tail: String,
-}
-
-/// Previous stats sample: the counter values plus WHEN they were read
-/// (`performance.now()` ms). Rates divide by the real elapsed time between
-/// samples — never by the interval's nominal 1000 ms, which is a lie under
-/// timer jitter and background-tab throttling.
-struct StatsSample {
-    t: f64,
-    frame: u32,
-    step: u32,
-    frame_work_us: u32,
-    step_work_us: u32,
-    /// Renderer GPU frame-time totals at sample time: (µs, samples), wrapping.
-    gpu: (u32, u32),
-    /// Accumulated time between presented frames (µs, wrapping) — see
-    /// `BodyMotion::frame_span_us`.
-    frame_span_us: u32,
-    /// Frames drawn with physics late (wrapping) — `BodyMotion::app_late`.
-    app_late: u32,
-    /// Per-executor accumulated task CPU µs (index 0 = the physics thread).
-    task_us: Vec<u32>,
-}
-
 /// `?reset` in the URL wipes every persisted app setting (resolution, MSAA,
-/// SMAA, stats toggle) so the load boots with fresh defaults — the escape
+/// SMAA, the stats panel and its groups) so the load boots with fresh defaults — the escape
 /// hatch when a device carries choices from old sessions (which override the
 /// device-class seeds and suppress the reduced-quality notice) and the
 /// browser's site-data UI won't surface them. Must run before ANY stored
@@ -386,6 +343,9 @@ fn maybe_reset_settings(window: &web_sys::Window) {
         ] {
             let _ = ls.remove_item(key);
         }
+        for key in crate::stats::open_keys() {
+            let _ = ls.remove_item(&key);
+        }
     }
     loading_log("?reset — stored settings cleared, booting with defaults");
 }
@@ -396,19 +356,9 @@ pub fn start() -> Result<(), JsValue> {
         maybe_reset_settings(&window);
     }
     let status = Mutable::new("booting…".to_string());
-    let stats = Mutable::new(StatsText::default());
+    // The Stats panel (hidden by default; see `stats`).
+    let stats = Panel::new();
     let about_open = Mutable::new(false);
-    // Stats panel visibility: OFF by default (it eats a lot of a phone
-    // screen); the bottom-left Stats chip toggles it and the choice persists.
-    // Never auto-open on a coarse device, even if a stored "open" flag says
-    // to — the panel eats a phone screen (the whole reason it's opt-in). The
-    // chip still toggles it within the session; the persisted choice only
-    // restores on fine-pointer (desktop) devices.
-    let stats_open = Mutable::new(
-        web_sys::window()
-            .map(|w| !coarse_pointer(&w) && stored_bool(&w, STATS_STORAGE_KEY).unwrap_or(false))
-            .unwrap_or(false),
-    );
     loading_log("wasm compiled — main thread booting");
 
     let app = html!("div", {
@@ -428,42 +378,14 @@ pub fn start() -> Result<(), JsValue> {
                 .text_signal(status.signal_cloned())
             }))
         }))
-        .child(html!("div", {
-            .class("stats")
-            .visible_signal(stats_open.signal())
-            // Three nodes so JUST the "app late" line can turn red when bad:
-            // the text above it, that line's span, the text below it.
-            .text_signal(stats.signal_cloned().map(|s| s.head))
-            .child(html!("span", {
-                .class_signal("sync-bad", stats.signal_cloned().map(|s| s.bad))
-                .text_signal(stats.signal_cloned().map(|s| s.sync))
-            }))
-            .text_signal(stats.signal_cloned().map(|s| s.tail))
-        }))
-        .child(stats_button(&stats_open))
+        .child(stats.dom())
+        .child(stats.button())
         .child(about_button(&about_open))
         .child(about_modal(&about_open))
     });
 
     dominator::append_dom(&dominator::body(), app);
     Ok(())
-}
-
-/// The bottom-left "Stats" chip: toggles the top-right worker-stats panel
-/// (hidden by default). Persists the choice like the graphics settings.
-fn stats_button(open: &Mutable<bool>) -> dominator::Dom {
-    html!("button", {
-        .class("stats-btn")
-        .class_signal("active", open.signal())
-        .text("Stats")
-        .event(clone!(open => move |_: dominator::events::Click| {
-            let next = !open.get();
-            open.set_neq(next);
-            if let Some(w) = web_sys::window() {
-                store_bool(&w, STATS_STORAGE_KEY, next);
-            }
-        }))
-    })
 }
 
 /// The one-time reduced-quality notice for touch devices: the coarse-pointer
@@ -630,7 +552,7 @@ fn about_modal(open: &Mutable<bool>) -> dominator::Dom {
             }))
             .child(html!("p", {
                 .text("The stats panel (the Stats button, bottom left) shows each thread \
-                       live. A \"task\" is \
+                       live; expand a thread for its breakdown. A \"task\" is \
                        one slice of Box3D's internal parallel-for: every physics step, \
                        the solver splits its work into small tasks that the physics \
                        thread and the pool workers race to claim from shared memory — \
@@ -722,7 +644,7 @@ pub fn fatal(message: &str) {
 fn setup(
     canvas: HtmlCanvasElement,
     status: Mutable<String>,
-    stats: Mutable<StatsText>,
+    stats: Rc<Panel>,
 ) -> Result<(), JsValue> {
     let window = web_sys::window().ok_or_else(|| JsValue::from_str("no window"))?;
 
@@ -797,7 +719,15 @@ fn setup(
     let camera_ring: &'static CameraRing = Box::leak(Box::new(CameraRing::new()));
     // Set by a drag or wheel; the frame loop writes the ring only then.
     let camera_dirty = Rc::new(Cell::new(false));
-    install_camera_frames(&window, camera.clone(), camera_ring, camera_dirty.clone())?;
+    // This thread's own per-frame work, for the Stats panel's page group.
+    let page_work = Rc::new(PageWork::default());
+    install_camera_frames(
+        &window,
+        camera.clone(),
+        camera_ring,
+        camera_dirty.clone(),
+        page_work.clone(),
+    )?;
 
     // Kick off the (async) audio load now; it stays silent until the first
     // gesture. `None` until ready, so input/handlers no-op against it meanwhile.
@@ -851,7 +781,20 @@ fn setup(
     // Flipped by the `Ready` handler below: the stats warm-up doesn't even
     // start until the renderer has committed and presented real frames.
     let render_ready = Rc::new(Cell::new(false));
-    install_stats(&window, stats, stats_refs.clone(), render_ready.clone())?;
+    // For timing this thread's own work (the Stats panel's page group).
+    let perf = window
+        .performance()
+        .ok_or_else(|| JsValue::from_str("no performance"))?;
+    // The renderer's latest `RenderMsg::Timings` (only sent while asked).
+    let render_timings: Rc<RefCell<Vec<TimingTotal>>> = Rc::new(RefCell::new(Vec::new()));
+    install_stats(
+        &window,
+        stats,
+        stats_refs.clone(),
+        render_ready.clone(),
+        render_timings.clone(),
+        page_work.clone(),
+    )?;
 
     // Shared handle to the physics worker (spawned later, once render hands us
     // the arena binding). We keep it only to hold the worker alive — input no
@@ -882,7 +825,7 @@ fn setup(
 
     // Handle messages coming back from the render worker.
     let on_render_msg = Closure::<dyn FnMut(MessageEvent)>::new(
-        clone!(physics, status, audio, stats_refs, res, user_pref, res_pct, render_ref, render_ready, notice_open, aa_compile => move |e: MessageEvent| {
+        clone!(physics, status, audio, stats_refs, res, user_pref, res_pct, render_ref, render_ready, render_timings, page_work, perf, notice_open, aa_compile => move |e: MessageEvent| {
             match serde_wasm_bindgen::from_value::<RenderMsg>(e.data()) {
                 Ok(RenderMsg::Progress { message }) => {
                     loading_log(&message);
@@ -907,11 +850,13 @@ fn setup(
                             // for its whole life, so MAIN spawns its task-pool workers
                             // (a live event loop is needed to start nested workers and
                             // to see any startup error they post back).
-                            let on_phys = Closure::<dyn FnMut(MessageEvent)>::new(clone!(audio, stats_refs => move |e: MessageEvent| {
+                            let on_phys = Closure::<dyn FnMut(MessageEvent)>::new(clone!(audio, stats_refs, page_work, perf => move |e: MessageEvent| {
+                                let t0 = perf.now();
                                 if let Ok(msg) = serde_wasm_bindgen::from_value::<AudioMsg>(e.data()) {
                                     if let Some(c) = audio.borrow_mut().as_mut() {
                                         c.on_audio(msg);
                                     }
+                                    page_work.cues(perf.now() - t0);
                                 } else if let Ok(PhysicsMsg::SpawnTaskWorkers { pool, count }) =
                                     serde_wasm_bindgen::from_value::<PhysicsMsg>(e.data())
                                 {
@@ -994,6 +939,7 @@ fn setup(
                     aa_compile.set(Some(message));
                 }
                 Ok(RenderMsg::AaCompileDone) => aa_compile.set(None),
+                Ok(RenderMsg::Timings { entries }) => *render_timings.borrow_mut() = entries,
                 Ok(RenderMsg::Error { message }) => {
                     loading_log(&format!("ERROR: {message}"));
                     status.set(format!("render error: {message}"));
@@ -1466,18 +1412,21 @@ fn install_camera_frames(
     camera: Rc<RefCell<OrbitCamera>>,
     ring: &'static CameraRing,
     dirty: Rc<Cell<bool>>,
+    page_work: Rc<PageWork>,
 ) -> Result<(), JsValue> {
-    let time_origin = window
+    let perf = window
         .performance()
-        .ok_or_else(|| JsValue::from_str("no performance"))?
-        .time_origin();
+        .ok_or_else(|| JsValue::from_str("no performance"))?;
+    let time_origin = perf.time_origin();
     let cb: FrameLoop = Rc::new(RefCell::new(None));
     let next = cb.clone();
     let win = window.clone();
     *cb.borrow_mut() = Some(Closure::new(move |t: f64| {
+        let t0 = perf.now();
         if dirty.replace(false) {
             ring.write(abs_time_us(time_origin, t), &camera.borrow());
         }
+        page_work.frame(perf.now() - t0);
         if let Some(f) = next.borrow().as_ref() {
             let _ = win.request_animation_frame(f.as_ref().unchecked_ref());
         }
@@ -1506,6 +1455,12 @@ fn install_keyboard(
         }
         let key = e.key();
         if key == " " || key == "Spacebar" {
+            // A button reached with the keyboard keeps Space: it presses the
+            // button. (One that was clicked does not: `:focus-visible` is the
+            // browser's own test for "focused from the keyboard".)
+            if on_keyboard_focused_control(&e) {
+                return;
+            }
             // Edge-triggered: ignore auto-repeat so one press = one hop.
             if !e.repeat() {
                 input.bump_jump();
@@ -1532,6 +1487,16 @@ fn install_keyboard(
     Ok(())
 }
 
+/// Whether a key event is aimed at a control that has the keyboard's focus.
+fn on_keyboard_focused_control(e: &KeyboardEvent) -> bool {
+    e.target()
+        .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
+        .is_some_and(|el| {
+            el.matches("button:focus-visible, select:focus-visible, a[href]:focus-visible")
+                .unwrap_or(false)
+        })
+}
+
 /// The `HELD_*` bit a key drives (WASD or arrows). Unknown keys → `None`.
 fn key_mask(key: &str) -> Option<u32> {
     match key {
@@ -1541,324 +1506,6 @@ fn key_mask(key: &str) -> Option<u32> {
         "d" | "D" | "ArrowRight" => Some(HELD_RIGHT),
         _ => None,
     }
-}
-
-/// EMA weight for the displayed fps / steps-per-second (per 1 s sample).
-/// High enough to converge in ~2–3 samples after a real change (a resolution
-/// drop, a heavy pile of balls), low enough to hold a rock-steady readout
-/// against per-sample noise.
-const STATS_EMA_ALPHA: f64 = 0.35;
-/// A rate window is only trusted between these bounds (ms). Below: two timer
-/// firings landed almost together (jitter) — the quotient would be noise.
-/// Above: the tab was throttled/hidden, so rAF wasn't running and the window
-/// measures the stall, not the framerate. Either way we re-baseline instead.
-const STATS_MIN_WINDOW_MS: f64 = 200.0;
-const STATS_MAX_WINDOW_MS: f64 = 3000.0;
-/// Consecutive windows with physics late before the "app late" line turns
-/// red. One late frame is an event (a tab switch, an AA recompile, a big pile
-/// of balls landing); persistence is a condition.
-const LATE_BAD_WINDOWS: u32 = 3;
-
-/// Frames that must present AFTER render reports `Ready` before counting
-/// starts. Boot isn't steady state — the loading overlay is fading, the
-/// startup SMAA reconcile recompiles pipelines (stalling frames right after
-/// `Ready`), caches are cold, the wasm engine is still tiering up — and those
-/// first samples read 2–3× the settled cost, polluting the EMAs with numbers
-/// the app never shows again. Counting frames (not wall time) means a stalled
-/// renderer keeps waiting instead of "warming up" through the stall.
-const STATS_WARMUP_FRAMES: u32 = 60;
-
-/// The top-right worker-stats panel: a 1 Hz `setInterval` that samples the
-/// shared-memory counters the workers already maintain — no messages, no new
-/// instrumentation. Rates are counter deltas divided by the REAL elapsed time
-/// between samples (`performance.now()`), then EMA-smoothed — a nominal-1 Hz
-/// timer actually wobbles and gets throttled in background tabs, so assuming
-/// 1000 ms makes fps flicker and go absurd around a tab switch. On
-/// `visibilitychange` the baseline resets, so the hidden span (during which
-/// rAF doesn't run at all) is never turned into a bogus rate. Counting only
-/// begins `STATS_WARMUP_FRAMES` presented frames after render's `Ready` — see
-/// that constant for why boot samples are discarded. What's shown:
-/// - display: the refresh rate of the browser's frame clock for this window,
-///   measured by a rAF loop on the main thread (see `refresh`) — no web API
-///   reports the screen's rate directly,
-/// - render: presented frames/s (the `BodyMotion` frame-tick). NOTE this is
-///   real presented fps, so it's vsync-capped — 60 on a 60 Hz display, 120 on
-///   a 120 Hz one; steady is the goal, not monitor-independent,
-/// - missed: display refreshes that went by with no new frame (the display
-///   showed the previous one again), per second over the latest window and in
-///   total — from the span the presented frames covered
-///   (`BodyMotion::frame_span_us`) over the measured refresh period. Nonzero
-///   means the renderer is not keeping up with the display: lower the
-///   resolution or the anti-aliasing,
-/// - gpu time: avg whole-frame GPU ms (the renderer's timestamp-query span,
-///   published via `BodyMotion::gpu_totals`) — THE number that says whether a
-///   frame can make vsync: a 120 Hz display allows 8.3 ms. `n/a` when the
-///   device has no `timestamp-query`,
-/// - cpu time: avg render-thread CPU ms per frame (`frame_work_us` delta
-///   over the frame delta) — the monitor-INDEPENDENT workload metric: what a
-///   frame actually costs, regardless of what refresh rate it's presented at,
-/// - physics time: avg physics-thread CPU ms per fixed step (same
-///   construction) — watch it grow as balls pile up; the budget at `SIM_HZ`
-///   240 is ~4.2 ms/step,
-/// - physics: fixed steps/s (locked to `SIM_HZ` when healthy),
-/// - app late: frames drawn before physics had finished the burst they show
-///   (`BodyMotion::app_late`), per second and in total. Each one is a frame
-///   that repeats the previous picture of the world. RED once it persists for
-///   [`LATE_BAD_WINDOWS`] windows: the physics thread can't keep up,
-/// - physics pool / physics main: how the solver's task CPU time split this
-///   window between the pool workers and the physics thread help-executing in
-///   `finishTask` — a share of measured µs, not of task counts,
-/// - balls: `BallMotions` count.
-fn install_stats(
-    window: &web_sys::Window,
-    stats: Mutable<StatsText>,
-    refs: Rc<RefCell<StatsRefs>>,
-    render_ready: Rc<Cell<bool>>,
-) -> Result<(), JsValue> {
-    let perf = window
-        .performance()
-        .ok_or_else(|| JsValue::from_str("no performance"))?;
-    // The display's refresh period, measured by a rAF loop of the main
-    // thread's own (see `refresh`), and the missed-frame count against it.
-    let refresh = crate::refresh::install(window)?;
-    let mut missed = crate::refresh::Missed::default();
-
-    // The previous sample. `None` forces a re-seed — at startup, and whenever
-    // the tab becomes visible again (shared with the visibility handler).
-    let baseline: Rc<RefCell<Option<StatsSample>>> = Rc::new(RefCell::new(None));
-    {
-        let baseline = baseline.clone();
-        let vis = Closure::<dyn FnMut()>::new(move || {
-            *baseline.borrow_mut() = None;
-        });
-        window
-            .document()
-            .ok_or_else(|| JsValue::from_str("no document"))?
-            .add_event_listener_with_callback("visibilitychange", vis.as_ref().unchecked_ref())?;
-        vis.forget();
-    }
-
-    let mut fps_ema: Option<f64> = None;
-    let mut steps_ema: Option<f64> = None;
-    let mut frame_work_ema: Option<f64> = None;
-    let mut gpu_ema: Option<f64> = None;
-    // Trusted windows seen with no GPU sample at all — after a few, the device
-    // evidently has no `timestamp-query` and the line says so.
-    let mut gpu_empty_windows: u32 = 0;
-    let mut step_work_ema: Option<f64> = None;
-    // Late frames since counting started (wrapping), and consecutive windows
-    // with any — the line turns red at `LATE_BAD_WINDOWS`.
-    let mut late_total: u32 = 0;
-    let mut late_windows: u32 = 0;
-    // The frame-tick value when `Ready` was first observed — counting starts
-    // `STATS_WARMUP_FRAMES` presented frames after it.
-    let mut warm_frame: Option<u32> = None;
-    let tick = Closure::<dyn FnMut()>::new(move || {
-        let refs = *refs.borrow();
-        let now = perf.now();
-
-        // Read the current counters (SAFETY, all blocks: leaked-for-the-session
-        // allocations in the shared `WebAssembly.Memory`; we only read atomics).
-        let motion_counts = refs.motion.map(|addr| {
-            let motion = unsafe { &*(addr as *const BodyMotion) };
-            (
-                motion.frame_tick(),
-                motion.latest_step(),
-                motion.frame_work_us(),
-                motion.step_work_us(),
-                motion.app_late(),
-            )
-        });
-        let (frame, step, frame_work_us, step_work_us, app_late) =
-            motion_counts.unwrap_or((0, 0, 0, 0, 0));
-        // Read AFTER the frame tick: render adds a frame's span before bumping
-        // its tick, so this span covers at least the frames counted above.
-        let frame_span_us = refs
-            .motion
-            .map(|addr| unsafe { &*(addr as *const BodyMotion) }.frame_span_us())
-            .unwrap_or(0);
-        let gpu_totals = refs
-            .motion
-            .map(|addr| unsafe { &*(addr as *const BodyMotion) }.gpu_totals())
-            .unwrap_or((0, 0));
-        let task_us = match refs.pool {
-            Some((addr, count)) => {
-                let pool = unsafe { &*(addr as *const TaskPool) };
-                pool.task_us_counts(count as usize + 1)
-            }
-            None => Vec::new(),
-        };
-        let prev = baseline.borrow_mut().replace(StatsSample {
-            t: now,
-            frame,
-            step,
-            frame_work_us,
-            step_work_us,
-            gpu: gpu_totals,
-            frame_span_us,
-            app_late,
-            task_us: task_us.clone(),
-        });
-
-        if motion_counts.is_none() {
-            fps_ema = None;
-            steps_ema = None;
-            frame_work_ema = None;
-            step_work_ema = None;
-            gpu_ema = None;
-            missed.reset();
-            late_total = 0;
-            late_windows = 0;
-            stats.set(StatsText {
-                head: "workers\n  main          ui · audio · input\n  render        \
-                       starting…\n  physics       starting…"
-                    .to_string(),
-                ..StatsText::default()
-            });
-            return;
-        }
-        // Warm-up: don't count anything until render reported `Ready` AND
-        // `STATS_WARMUP_FRAMES` real frames have presented since. The baseline
-        // keeps refreshing above, so the first trusted window starts exactly
-        // where the warm-up ends.
-        if !render_ready.get() {
-            return; // still shows "starting…" from before
-        }
-        let base = *warm_frame.get_or_insert(frame);
-        if frame.wrapping_sub(base) < STATS_WARMUP_FRAMES {
-            stats.set(StatsText {
-                head: "workers\n  main          ui · audio · input\n  render        \
-                       warming up…\n  physics       warming up…"
-                    .to_string(),
-                ..StatsText::default()
-            });
-            return;
-        }
-        // No trustworthy window (first sample, or a jittered/throttled gap):
-        // the baseline is re-seeded above — keep the last text on screen.
-        let Some(prev) =
-            prev.filter(|p| (STATS_MIN_WINDOW_MS..STATS_MAX_WINDOW_MS).contains(&(now - p.t)))
-        else {
-            return;
-        };
-        let dt = (now - prev.t) / 1000.0;
-
-        let frames = frame.wrapping_sub(prev.frame);
-        let steps = step.wrapping_sub(prev.step);
-        let refresh = refresh.borrow();
-        missed.window(
-            frames,
-            frame_span_us.wrapping_sub(prev.frame_span_us) as f64 / 1000.0,
-            now - prev.t,
-            refresh.period_ms(),
-        );
-        let fps = frames as f64 / dt;
-        let sps = steps as f64 / dt;
-        let f = fps_ema.get_or_insert(fps);
-        *f += (fps - *f) * STATS_EMA_ALPHA;
-        let s = steps_ema.get_or_insert(sps);
-        *s += (sps - *s) * STATS_EMA_ALPHA;
-        // Avg CPU ms per frame / per step over the window (needs a nonzero
-        // count to divide by — otherwise hold the previous smoothed value).
-        if frames > 0 {
-            let ms = frame_work_us.wrapping_sub(prev.frame_work_us) as f64 / frames as f64 / 1000.0;
-            let w = frame_work_ema.get_or_insert(ms);
-            *w += (ms - *w) * STATS_EMA_ALPHA;
-        }
-        if steps > 0 {
-            let ms = step_work_us.wrapping_sub(prev.step_work_us) as f64 / steps as f64 / 1000.0;
-            let w = step_work_ema.get_or_insert(ms);
-            *w += (ms - *w) * STATS_EMA_ALPHA;
-        }
-        // Avg GPU ms per sampled frame over the window (the readback skips
-        // frames while one is in flight, so divide by GPU samples, not frames).
-        let gpu_samples = gpu_totals.1.wrapping_sub(prev.gpu.1);
-        if gpu_samples > 0 {
-            gpu_empty_windows = 0;
-            let ms = gpu_totals.0.wrapping_sub(prev.gpu.0) as f64 / gpu_samples as f64 / 1000.0;
-            let g = gpu_ema.get_or_insert(ms);
-            *g += (ms - *g) * STATS_EMA_ALPHA;
-        } else {
-            gpu_empty_windows = gpu_empty_windows.saturating_add(1);
-        }
-        let gpu_line = match gpu_ema {
-            Some(g) => format!("{g:.1} ms"),
-            None if gpu_empty_windows >= 3 => "n/a".to_string(),
-            None => "—".to_string(),
-        };
-        let cpu = |ema: Option<f64>, digits: usize| match ema {
-            Some(w) => format!("{w:.digits$} ms"),
-            None => "—".to_string(),
-        };
-
-        let head = format!(
-            "workers\n  main          ui · audio · input\n  display       {}\n  render        \
-             {:.0} fps\n  missed        {}\n  gpu time      {}\n  cpu time      {}\n  \
-             physics time  {}\n  physics       {:.0} steps/s\n",
-            refresh.line(),
-            *f,
-            missed.line(),
-            gpu_line,
-            cpu(frame_work_ema, 1),
-            cpu(step_work_ema, 2),
-            *s,
-        );
-        // Physics late (see the doc comment): RED only when it persists
-        // across consecutive windows.
-        let late = app_late.wrapping_sub(prev.app_late);
-        late_total = late_total.wrapping_add(late);
-        late_windows = if late > 0 { late_windows + 1 } else { 0 };
-        let bad = late_windows >= LATE_BAD_WINDOWS;
-        let sync = format!(
-            "  app late      {:.0}/s · {} total",
-            late as f64 / dt,
-            late_total
-        );
-
-        let mut lines = String::new();
-
-        // The solver's work split as a TRUE work share: each executor
-        // accumulates the CPU µs its claimed tasks took (`task_us_counts`;
-        // index 0 is the physics thread help-executing in `finishTask`), so a
-        // 500 µs task counts 100× a 5 µs one — unlike raw claim counts. The
-        // per-worker split is scheduler randomness, so only the pool-vs-main
-        // split is shown. Watch the pool's share grow as balls pile up.
-        if task_us.len() > 1 && prev.task_us.len() == task_us.len() {
-            let deltas: Vec<u64> = task_us
-                .iter()
-                .zip(&prev.task_us)
-                .map(|(&now, &then)| now.wrapping_sub(then) as u64)
-                .collect();
-            let total: u64 = deltas.iter().sum();
-            let workers = task_us.len() - 1;
-            let pool_pct = (deltas[1..].iter().sum::<u64>() * 100 + total / 2).checked_div(total);
-            lines.push_str(&match pool_pct {
-                Some(share) => format!(
-                    "\n  physics pool  {workers} workers · {share}%\n  physics main  {}%",
-                    100 - share
-                ),
-                None => format!("\n  physics pool  {workers} workers · idle\n  physics main  idle"),
-            });
-        }
-
-        if let Some(addr) = refs.balls {
-            let balls = unsafe { &*(addr as *const BallMotions) };
-            lines.push_str(&format!("\n\nballs dropped  {}", balls.count()));
-        }
-
-        stats.set(StatsText {
-            head,
-            sync,
-            bad,
-            tail: lines,
-        });
-    });
-    window.set_interval_with_callback_and_timeout_and_arguments_0(
-        tick.as_ref().unchecked_ref(),
-        1000,
-    )?;
-    tick.forget();
-    Ok(())
 }
 
 fn set(obj: &js_sys::Object, key: &str, value: &JsValue) {

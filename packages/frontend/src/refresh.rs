@@ -5,7 +5,7 @@
 //! but record the time between callbacks. The main thread is light (DOM,
 //! input, audio), so it makes nearly every refresh, and the typical interval
 //! is the refresh period `P` of the browser's frame clock for this window.
-//! That is what the panel's `display` line shows. (It is the clock the browser
+//! That is what the panel's `display` group shows. (It is the clock the browser
 //! paces frames with; on an odd multi-monitor setup that can differ from the
 //! panel's physical refresh, and no page can see past it.)
 //!
@@ -73,7 +73,7 @@ impl Refresh {
         (!inliers.is_empty()).then(|| inliers.iter().sum::<f64>() / inliers.len() as f64)
     }
 
-    /// The panel's `display` value.
+    /// The panel's `refresh rate` value.
     pub fn line(&self) -> String {
         match self.period_ms() {
             Some(p) => format!("{:.0} Hz", 1000.0 / p),
@@ -135,10 +135,10 @@ impl Missed {
         *self = Self::default();
     }
 
-    /// The panel's `missed` value.
+    /// The panel's `missed frames` value.
     pub fn line(&self) -> String {
         match self.rate {
-            Some(rate) => format!("{rate:.0}/s · {} total", self.sum.max(0)),
+            Some(rate) => format!("{rate:.0} / s · {} total", self.sum.max(0)),
             None => "—".to_string(),
         }
     }

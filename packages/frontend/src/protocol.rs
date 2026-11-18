@@ -34,7 +34,7 @@
 //! accumulator / STEP)` — one frame later, because the burst runs on its own
 //! thread while frame `k` draws. If the burst has not finished in time, the
 //! newest step is older than `D`: render holds it (no extrapolation) and
-//! counts the frame as "app late".
+//! counts the frame as a late frame (the Stats panel's physics group).
 
 use core::arch::wasm32::{memory_atomic_notify, memory_atomic_wait32};
 use core::sync::atomic::{fence, AtomicU32, Ordering};
@@ -98,6 +98,22 @@ pub fn abs_time_us(time_origin_ms: f64, t_ms: f64) -> u32 {
 pub fn time_diff_us(a: u32, b: u32) -> i32 {
     a.wrapping_sub(b) as i32
 }
+
+/// The Stats panel's breakdowns that cost something to measure, as bits in
+/// [`BodyMotion::detail`]: main sets a group's bit while that group is expanded
+/// (and the panel open), and the workers measure the breakdown only then.
+pub const DETAIL_GPU: u32 = 1 << 0;
+pub const DETAIL_RENDERER: u32 = 1 << 1;
+pub const DETAIL_PHYSICS: u32 = 1 << 2;
+
+/// The phases of one physics step the Stats panel lists (while its physics
+/// group is expanded), in the order they run; see `physics_thread`.
+pub const STEP_PHASES: [&str; 4] = [
+    "input + ball drops",
+    "Box3D step",
+    "contacts + sound cues",
+    "publish poses",
+];
 
 /// Everything the physics thread needs to start driving the scene's ball. The
 /// render thread owns the renderer (hence the shared transform arena) *and*
@@ -460,7 +476,7 @@ pub struct BodyMotion {
     frame_time_valid: AtomicU32,
     /// Frames render drew while the newest published step was still older
     /// than the frame's display time (physics late with its burst), wrapping.
-    /// The stats panel shows it as "app late".
+    /// The Stats panel shows them as "late frames".
     app_late: AtomicU32,
     /// Accumulated render-thread CPU time, in MICROSECONDS (wrapping): how long
     /// each frame's work — interpolation, transform update, encode + submit —
@@ -493,6 +509,17 @@ pub struct BodyMotion {
     /// by with no new frame (see `refresh::Missed`). Added BEFORE the frame's
     /// tick bump, at the start of the frame.
     frame_span_us: AtomicU32,
+    /// Written by main: the `DETAIL_*` bits of the Stats groups that are
+    /// expanded. Render and physics read it once per frame.
+    detail: AtomicU32,
+    /// Physics side, only while [`DETAIL_PHYSICS`] is set: running totals of
+    /// each [`STEP_PHASES`] phase in NANOSECONDS (wrapping), and the steps
+    /// they cover. Republished a few times a second, not per step, under a
+    /// seqlock (odd `step_phase_version` = being written) so a reader never
+    /// pairs one publish's totals with another's step count.
+    step_phase_version: AtomicU32,
+    step_phase_ns: [AtomicU32; STEP_PHASES.len()],
+    step_phase_steps: AtomicU32,
 }
 
 impl BodyMotion {
@@ -509,7 +536,57 @@ impl BodyMotion {
             gpu_total_us: AtomicU32::new(0),
             gpu_samples: AtomicU32::new(0),
             frame_span_us: AtomicU32::new(0),
+            detail: AtomicU32::new(0),
+            step_phase_version: AtomicU32::new(0),
+            step_phase_ns: [const { AtomicU32::new(0) }; STEP_PHASES.len()],
+            step_phase_steps: AtomicU32::new(0),
         }
+    }
+
+    /// Main side: which Stats breakdowns to measure (`DETAIL_*` bits).
+    pub fn set_detail(&self, bits: u32) {
+        self.detail.store(bits, Ordering::Relaxed);
+    }
+
+    /// Worker side: the `DETAIL_*` bits main last set.
+    pub fn detail(&self) -> u32 {
+        self.detail.load(Ordering::Relaxed)
+    }
+
+    /// Physics side: publish the running per-phase totals (ms) and the steps
+    /// they cover. Stored as wrapping ns; readers diff two reads.
+    pub fn set_step_phases(&self, totals_ms: &[f64; STEP_PHASES.len()], steps: u64) {
+        let v = self.step_phase_version.load(Ordering::Relaxed);
+        self.step_phase_version
+            .store(v.wrapping_add(1), Ordering::Relaxed);
+        fence(Ordering::Release);
+        for (slot, ms) in self.step_phase_ns.iter().zip(totals_ms) {
+            slot.store((ms * 1e6) as u64 as u32, Ordering::Relaxed);
+        }
+        self.step_phase_steps.store(steps as u32, Ordering::Relaxed);
+        fence(Ordering::Release);
+        self.step_phase_version
+            .store(v.wrapping_add(2), Ordering::Relaxed);
+    }
+
+    /// Stats side: `(per-phase ns, steps)`, all wrapping; `None` if a publish
+    /// kept racing the read (the next sample gets it).
+    pub fn step_phases(&self) -> Option<([u32; STEP_PHASES.len()], u32)> {
+        for _ in 0..64 {
+            let v1 = self.step_phase_version.load(Ordering::Relaxed);
+            if v1 & 1 != 0 {
+                core::hint::spin_loop();
+                continue;
+            }
+            fence(Ordering::Acquire);
+            let ns = core::array::from_fn(|i| self.step_phase_ns[i].load(Ordering::Relaxed));
+            let steps = self.step_phase_steps.load(Ordering::Relaxed);
+            fence(Ordering::Acquire);
+            if self.step_phase_version.load(Ordering::Relaxed) == v1 {
+                return Some((ns, steps));
+            }
+        }
+        None
     }
 
     /// Render side: publish the renderer's cumulative GPU frame time (µs) and
@@ -881,6 +958,35 @@ pub enum RenderMsg {
     AaCompileDone,
     /// Something failed in the render worker.
     Error { message: String },
+    /// The renderer breakdowns the Stats panel asked for (see
+    /// [`BodyMotion::detail`]), as running totals: posted a few times a
+    /// second, and only while asked.
+    Timings { entries: Vec<TimingTotal> },
+}
+
+/// What a [`TimingTotal`] times.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TimingKind {
+    /// One of the render worker's own frame phases.
+    RendererPhase,
+    /// awsm-renderer's CPU time inside one pass.
+    RendererPass,
+    /// The GPU's time for one pass.
+    GpuPass,
+    /// What the renderer's sampled per-pass CPU scopes add to the average
+    /// frame (see `render_profile`).
+    RendererOverhead,
+}
+
+/// A running total: `total_ms` over `count` frames. The stats sampler diffs
+/// two of them for the mean over its window.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimingTotal {
+    pub kind: TimingKind,
+    pub name: String,
+    pub total_ms: f64,
+    pub count: f64,
 }
 
 /// Main thread → render thread: the user clicked the canvas at the given NDC

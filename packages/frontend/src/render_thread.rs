@@ -31,6 +31,7 @@ use crate::protocol::{
     ColliderShapeMsg, DropMsg, OrbitCamera, PhysicsInit, PoseRing, QualityMsg, RenderMsg,
     ResizeMsg, ROLE_FLOOR, STEP_US,
 };
+use crate::render_profile::{Phase, Profile};
 
 /// The boxed RAF callback, self-referenced so the render loop can reschedule
 /// itself each frame (and stays alive for the worker's lifetime). The `f64`
@@ -184,9 +185,10 @@ async fn run(
     // core GPU resources — takes visible time here.
     let mut renderer = AwsmRendererBuilder::new(gpu_builder)
         .with_anti_aliasing(aa_config(desired_aa))
-        // GPU frame timing for the stats panel's "gpu time" line: `Frame` tier
-        // = timestamp queries on the renderer's passes, folded into one
-        // whole-frame span (cheap; silently off without `timestamp-query`).
+        // GPU timing for the Stats panel's GPU group: `Frame` tier =
+        // timestamp queries on every pass, folded into one whole-frame span
+        // (cheap; silently off without `timestamp-query`). The CPU tier is
+        // `Off` except on the frames `render_profile` samples while asked.
         .with_logging(awsm_renderer::debug::AwsmRendererLogging {
             gpu: awsm_renderer::debug::TimingTier::Frame,
             ..Default::default()
@@ -464,12 +466,14 @@ async fn run(
     let mut frame_count: u32 = 0;
     // Last GPU-timing sample count published to the stats panel.
     let mut gpu_samples_seen: u64 = 0;
+    // The Stats panel's renderer/GPU breakdowns, only while it asks.
+    let mut profile = Profile::default();
     // One arena binding per minted (dropped-ball) visual duplicate.
     let mut ball_bindings: Vec<awsm_renderer::buffer::shared_arena::SlotBinding> = Vec::new();
 
     // Worker-scope `performance` for the frame-work clock. This is NOT frame
     // pacing (the vsync timestamp does that) — it measures how long this
-    // thread's work takes, published for the stats panel's ms/frame line.
+    // thread's work takes, published for the Stats panel's renderer group.
     let perf = js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("performance"))
         .ok()
         .and_then(|p| p.dyn_into::<web_sys::Performance>().ok())
@@ -563,6 +567,9 @@ async fn run(
             }
             return;
         };
+
+        profile.begin_frame(r, motion.detail());
+        let mut lap_ms = work_t0;
 
         // ── Frame start: publish this frame's time, waking physics ──────────
         // The rAF argument is the frame's VSYNC-aligned time (see `RafCell`).
@@ -662,6 +669,7 @@ async fn run(
                 foreign_write(*b, dirty_words_addr, bytes);
             }
         }
+        lap_ms = profile.lap(Phase::ReadApp, &perf, lap_ms);
 
         let cam = camera_loop.borrow();
         // ONE camera API: a view matrix plus projection params. The renderer
@@ -676,12 +684,15 @@ async fn run(
         params.focus_distance = cam.radius;
         let _ = r.set_camera(view, params);
         drop(cam);
+        lap_ms = profile.lap(Phase::SetCamera, &perf, lap_ms);
         // Folds the ball slot we just wrote (plus any other dirty slots) into
         // world matrices for this frame.
         r.update_transforms();
+        lap_ms = profile.lap(Phase::UpdateTransforms, &perf, lap_ms);
         if let Err(err) = r.render(None) {
             tracing::warn!("render thread: render error: {err}");
         }
+        profile.lap(Phase::Render, &perf, lap_ms);
 
         // Publish the renderer's GPU frame-time totals for the stats panel
         // (timestamp-query readbacks land a few frames late; only push when a
@@ -693,7 +704,11 @@ async fn run(
             }
         }
 
-        // Publish this frame's CPU cost (µs) for the stats panel's ms/frame.
+        if let Some(entries) = profile.end_frame(vsync_ms) {
+            post_to_main(&RenderMsg::Timings { entries });
+        }
+
+        // Publish this frame's CPU cost (µs) for the Stats panel's renderer group.
         motion.add_frame_work_us(((perf.now() - work_t0) * 1000.0).max(0.0) as u32);
 
         frame_count = frame_count.wrapping_add(1);

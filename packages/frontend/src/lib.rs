@@ -28,7 +28,9 @@ pub mod physics_tasks;
 pub mod physics_thread;
 pub mod protocol;
 pub mod refresh;
+pub mod render_profile;
 pub mod render_thread;
+pub mod stats;
 
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;

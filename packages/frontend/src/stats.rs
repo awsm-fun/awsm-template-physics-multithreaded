@@ -51,6 +51,10 @@ use crate::protocol::{
     STEP_PHASES,
 };
 
+mod value;
+
+use value::{bar_state, bar_width, pieces, Piece};
+
 /// Smoothing weight of each new sample: a real change shows within 2–3
 /// samples, while the readout holds steady against noise.
 const EMA_ALPHA: f64 = 0.35;
@@ -78,6 +82,30 @@ const SCOPE_GROUPS: [(TimingKind, &str); 4] = [
     (TimingKind::RendererSubmit, "submit"),
     (TimingKind::RendererHook, "hooks"),
 ];
+
+/// A lane of the frame budget: the GPU or a thread. Its colour (index.html,
+/// `--lane-*`) is a dot on its budget row and on its group's header, so the
+/// two pair up; About's Stats tab marks its sections the same way.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Lane {
+    Gpu,
+    Renderer,
+    /// Physics: the physics worker (its pool runs inside its step).
+    Sim,
+    Page,
+}
+
+impl Lane {
+    /// The `data-lane` attribute that picks the colour.
+    pub fn attr(self) -> &'static str {
+        match self {
+            Lane::Gpu => "gpu",
+            Lane::Renderer => "renderer",
+            Lane::Sim => "sim",
+            Lane::Page => "page",
+        }
+    }
+}
 
 /// The groups, top to bottom.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -130,6 +158,16 @@ impl Group {
             Group::Renderer => DETAIL_RENDERER,
             Group::Physics => DETAIL_PHYSICS,
             Group::Budget | Group::Display | Group::Page => 0,
+        }
+    }
+
+    fn lane(self) -> Option<Lane> {
+        match self {
+            Group::Gpu => Some(Lane::Gpu),
+            Group::Renderer => Some(Lane::Renderer),
+            Group::Physics => Some(Lane::Sim),
+            Group::Page => Some(Lane::Page),
+            Group::Budget | Group::Display => None,
         }
     }
 }
@@ -206,13 +244,15 @@ fn smooth(ema: Option<f64>, value: f64) -> f64 {
 }
 
 /// One row of a group: label left, value right. `depth` indents it under
-/// the row above (a breakdown of it), up to two levels; `bad` turns it red.
+/// the row above (a breakdown of it), up to two levels; `bad` turns it red;
+/// `budget` makes it a lane of the frame budget, with its share of it.
 #[derive(Clone, PartialEq)]
 struct Row {
     label: String,
     value: String,
     depth: u8,
     bad: bool,
+    budget: Option<(Lane, f64)>,
 }
 
 fn row(label: impl Into<String>, value: impl Into<String>) -> Row {
@@ -221,6 +261,7 @@ fn row(label: impl Into<String>, value: impl Into<String>) -> Row {
         value: value.into(),
         depth: 0,
         bad: false,
+        budget: None,
     }
 }
 
@@ -239,6 +280,47 @@ impl Row {
         self.bad = bad;
         self
     }
+
+    fn budget(mut self, lane: Lane, share: f64) -> Self {
+        self.budget = Some((lane, share));
+        self
+    }
+}
+
+/// A lane's dot.
+fn dot(lane: Lane) -> Dom {
+    html!("span", {
+        .class("stats-dot")
+        .attr("data-lane", lane.attr())
+    })
+}
+
+/// A budget lane's share as a bar; its colour says how close to the budget.
+fn bar(share: f64) -> Dom {
+    html!("span", {
+        .class("stats-bar")
+        .apply(|dom| match bar_state(share) {
+            Some(state) => dom.class(state),
+            None => dom,
+        })
+        .child(html!("span", { .style("width", bar_width(share)) }))
+    })
+}
+
+/// A value as it is shown: the numbers bright, the units and words around
+/// them smaller and dimmer; a budget lane's after the bar for its `share`.
+fn value(text: &str, share: Option<f64>) -> Dom {
+    html!("span", {
+        .class("stats-value")
+        .apply(|dom| match share {
+            Some(share) => dom.child(bar(share)),
+            None => dom,
+        })
+        .children(pieces(text).into_iter().map(|piece| match piece {
+            Piece::Num(text) => html!("span", { .class("stats-num").text(text) }),
+            Piece::Unit(text) => html!("span", { .class("stats-unit").text(text) }),
+        }))
+    })
 }
 
 struct GroupView {
@@ -366,13 +448,16 @@ impl Panel {
                         .attr("aria-controls", &rows_id)
                         .attr_signal("aria-expanded", view.open.signal().map(|open| if open { "true" } else { "false" }))
                         .child(html!("span", {
+                            .class("stats-name")
                             .text_signal(view.open.signal().map(|open| if open { "▾ " } else { "▸ " }))
+                            .apply(|dom| match view.group.lane() {
+                                Some(lane) => dom.child(dot(lane)),
+                                None => dom,
+                            })
                             .text_signal(view.label.signal_cloned())
                         }))
                         .text(" ") // for a screen reader; the layout ignores it
-                        .child(html!("span", {
-                            .text_signal(view.headline.signal_cloned())
-                        }))
+                        .child_signal(view.headline.signal_cloned().map(|headline| Some(value(&headline, None))))
                         .event(clone!(panel => move |_: dominator::events::Click| {
                             let view = &panel.groups[index];
                             let open = !view.open.get();
@@ -393,8 +478,15 @@ impl Panel {
                                 .apply_if(row.depth == 1, |dom| dom.class("stats-nested"))
                                 .apply_if(row.depth == 2, |dom| dom.class("stats-nested-2"))
                                 .apply_if(row.bad, |dom| dom.class("stats-bad"))
-                                .child(html!("span", { .text(&row.label) }))
-                                .child(html!("span", { .text(&row.value) }))
+                                .child(html!("span", {
+                                    .class("stats-name")
+                                    .apply(|dom| match row.budget {
+                                        Some((lane, _)) => dom.child(dot(lane)),
+                                        None => dom,
+                                    })
+                                    .text(&row.label)
+                                }))
+                                .child(value(&row.value, row.budget.map(|(_, share)| share)))
                             })
                         }))
                     }),
@@ -947,19 +1039,23 @@ fn show_budget(
     };
     // The pool threads get no lane: they run in parallel with the physics
     // worker, inside the step it times (it waits for them there).
-    let lanes: Vec<(String, f64)> = [
-        (Group::Gpu.label().to_string(), figures.gpu),
-        (Group::Renderer.label().to_string(), figures.frame_work),
-        (physics_label(pool), figures.physics_per_frame),
-        (Group::Page.label().to_string(), figures.page),
+    let lanes: Vec<(String, Lane, f64)> = [
+        (Group::Gpu.label().to_string(), Lane::Gpu, figures.gpu),
+        (
+            Group::Renderer.label().to_string(),
+            Lane::Renderer,
+            figures.frame_work,
+        ),
+        (physics_label(pool), Lane::Sim, figures.physics_per_frame),
+        (Group::Page.label().to_string(), Lane::Page, figures.page),
     ]
     .into_iter()
-    .filter_map(|(label, ms)| Some((label, ms?)))
+    .filter_map(|(label, lane, ms)| Some((label, lane, ms?)))
     .collect();
 
     let mut headline = format!("{budget:.1} ms ({:.0} Hz)", 1000.0 / budget);
     let mut over = false;
-    if let Some(largest) = lanes.iter().map(|(_, ms)| *ms).reduce(f64::max) {
+    if let Some(largest) = lanes.iter().map(|(_, _, ms)| *ms).reduce(f64::max) {
         let headroom = budget - largest;
         over = headroom < 0.0;
         if over {
@@ -970,7 +1066,9 @@ fn show_budget(
     }
     let mut rows: Vec<Row> = lanes
         .iter()
-        .map(|(label, ms)| row(label.as_str(), budget_share(*ms, budget)))
+        .map(|(label, lane, ms)| {
+            row(label.as_str(), budget_share(*ms, budget)).budget(*lane, ms / budget)
+        })
         .collect();
     if let (Some(renderer), Some(gpu)) = (figures.frame_work, figures.gpu) {
         rows.push(row(

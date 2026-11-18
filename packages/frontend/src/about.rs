@@ -8,6 +8,7 @@ use wasm_bindgen::JsCast;
 use web_sys::HtmlElement;
 
 use crate::main_thread::{keep_keys_in_modal, QUALITY_NOTICE_ID};
+use crate::stats::Lane;
 
 const REPO: &str = "https://github.com/awsm-fun/awsm-template-physics-multithreaded";
 
@@ -241,8 +242,7 @@ fn stats_tab() -> Vec<Dom> {
                    click a group to open its breakdown. A breakdown is only measured while \
                    its group is open, so the panel costs nothing when it is closed.")
         }),
-        prose(
-            "p",
+        units(
             "`ms / frame` is time per rendered frame. `µs / step` is time per simulation \
              step (1000 µs = 1 ms). `/ s` is per second.",
         ),
@@ -292,7 +292,7 @@ fn stats_tab() -> Vec<Dom> {
                  stutter: lower the resolution or the anti-aliasing in Settings.",
             ),
         ]),
-        heading("GPU"),
+        lane_heading("GPU", Lane::Gpu),
         terms(&[
             (
                 "GPU time per frame",
@@ -305,7 +305,7 @@ fn stats_tab() -> Vec<Dom> {
                  can add up to more than the frame.",
             ),
         ]),
-        heading("renderer (render worker)"),
+        lane_heading("renderer (render worker)", Lane::Renderer),
         terms(&[
             ("the header", "The render thread's CPU time per frame."),
             (
@@ -325,7 +325,10 @@ fn stats_tab() -> Vec<Dom> {
                  untimed). The smallest rows are folded into \"N more under 1 µs\".",
             ),
         ]),
-        heading("physics (Box3D, physics worker + N pool threads)"),
+        lane_heading(
+            "physics (Box3D, physics worker + N pool threads)",
+            Lane::Sim,
+        ),
         terms(&[
             (
                 "the header",
@@ -355,7 +358,7 @@ fn stats_tab() -> Vec<Dom> {
             ),
             ("balls dropped", "How many balls you have dropped."),
         ]),
-        heading("page (main thread)"),
+        lane_heading("page (main thread)", Lane::Page),
         terms(&[(
             "camera frame loop, sound cues",
             "The page's own work per frame: the camera and the sound cues it plays. It \
@@ -376,12 +379,31 @@ fn heading(text: &str) -> Dom {
     html!("h3", { .text(text) })
 }
 
+/// A Stats-tab heading for a group with a lane: its dot, as in the panel.
+fn lane_heading(text: &str, lane: Lane) -> Dom {
+    html!("h3", { .attr("data-lane", lane.attr()).text(text) })
+}
+
 /// `text` in a `tag` element, each `backticked` part set as code.
 fn prose(tag: &str, text: &str) -> Dom {
+    marked(tag, text, |part| html!("code", { .text(part) }))
+}
+
+/// A paragraph about units, each `backticked` unit a pill.
+fn units(text: &str) -> Dom {
+    marked(
+        "p",
+        text,
+        |unit| html!("span", { .class("about-unit").text(unit) }),
+    )
+}
+
+/// `text` in a `tag` element, each `backticked` part made by `mark`.
+fn marked(tag: &str, text: &str, mark: fn(&str) -> Dom) -> Dom {
     html!(tag, {
         .children(text.split('`').enumerate().map(|(i, part)| {
             if i % 2 == 1 {
-                html!("code", { .text(part) })
+                mark(part)
             } else {
                 dominator::text(part)
             }

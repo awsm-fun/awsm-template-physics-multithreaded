@@ -22,7 +22,10 @@
 //! * the scopes are on for one frame in [`PASS_TIMING_EVERY`] only, and the
 //!   phases are taken from the other frames, which are undisturbed;
 //! * what the scopes cost is measured, as the difference between the render
-//!   phase with and without them, and published as a row of its own;
+//!   phase with and without them, and published as a row of its own. One
+//!   estimate is made per publish and the median of the last few is used, so
+//!   that a frame that hitched (a pipeline compile, a collection) does not
+//!   pass for the scopes' doing;
 //! * each pass has the scope's share of its reading taken out. A scope's
 //!   reading runs from the end of its first lookup to the end of its second,
 //!   so it contains one of the two: half of what the scope costs.
@@ -30,31 +33,31 @@
 //! [`BodyMotion::detail`]: crate::protocol::BodyMotion::detail
 //! [`RenderMsg::Timings`]: crate::protocol::RenderMsg::Timings
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use awsm_renderer::debug::TimingTier;
 use awsm_renderer::{profiling, AwsmRenderer};
 
 use crate::protocol::{TimingKind, TimingTotal, DETAIL_GPU, DETAIL_RENDERER};
 
-/// The phases of one frame; the Stats panel lists them by these names, in
-/// this order (the same in every template).
+/// The phases of one frame, in the order they run; the Stats panel lists
+/// them by these names.
 #[derive(Clone, Copy)]
 pub enum Phase {
     /// Everything up to the transforms being written: waking physics, the
     /// camera ring, sampling + interpolating the published steps, minting
     /// dropped balls.
     ReadApp,
-    UpdateTransforms,
     SetCamera,
+    UpdateTransforms,
     /// `AwsmRenderer::render`: encoding every pass and submitting.
     Render,
 }
 
 pub const PHASE_NAMES: [&str; 4] = [
     "read app state + interpolate",
-    "update transforms",
     "set camera",
+    "update transforms",
     "render (encode + submit)",
 ];
 
@@ -68,6 +71,9 @@ pub const OVERHEAD_NAME: &str = "timing the passes";
 const PASS_TIMING_EVERY: u64 = 16;
 /// How often the totals go to main, in milliseconds.
 const PUBLISH_EVERY_MS: f64 = 250.0;
+/// The scope cost in use is the median of this many estimates, one per
+/// publish that had frames of both kinds: a few seconds' worth.
+const SCOPE_ESTIMATES: usize = 15;
 
 #[derive(Default)]
 pub struct Profile {
@@ -81,16 +87,26 @@ pub struct Profile {
     /// and the frames counted.
     phase_ms: [f64; 4],
     plain_frames: u64,
-    /// The same for the render phase over the frames WITH them.
-    timed_render_ms: f64,
+    /// The frames WITH them so far.
     timed_frames: u64,
+    /// The render phase since the last publish, on frames of each kind.
+    window: Window,
 
     /// Per scope: the renderer's totals at the last publish, and our running
     /// total with the scope's own share taken out.
     passes: HashMap<&'static str, PassTotal>,
-    /// Scope runs counted so far, and the running total of what they cost.
-    scope_runs: u64,
+    /// The latest estimates of what one scope costs (ms), and the running
+    /// total of what the scopes cost by them.
+    scope_estimates: VecDeque<f64>,
     overhead_ms: f64,
+}
+
+#[derive(Default)]
+struct Window {
+    plain_render_ms: f64,
+    plain_frames: u32,
+    timed_render_ms: f64,
+    timed_frames: u32,
 }
 
 #[derive(Default)]
@@ -127,8 +143,13 @@ impl Profile {
         let now = perf.now();
         if !self.timing_passes {
             self.phase_ms[phase as usize] += now - since_ms;
-        } else if matches!(phase, Phase::Render) {
-            self.timed_render_ms += now - since_ms;
+        }
+        if matches!(phase, Phase::Render) {
+            if self.timing_passes {
+                self.window.timed_render_ms += now - since_ms;
+            } else {
+                self.window.plain_render_ms += now - since_ms;
+            }
         }
         now
     }
@@ -140,8 +161,10 @@ impl Profile {
         let gpu = self.detail & DETAIL_GPU != 0;
         if self.timing_passes {
             self.timed_frames += 1;
+            self.window.timed_frames += 1;
         } else if renderer {
             self.plain_frames += 1;
+            self.window.plain_frames += 1;
         }
         if !(renderer || gpu) || (frame_ms - self.published_at_ms).abs() < PUBLISH_EVERY_MS {
             return None;
@@ -173,31 +196,34 @@ impl Profile {
 
         // What the scopes ran and read since the last publish.
         let stats = profiling::cpu_timing_stats();
-        let mut window = Vec::with_capacity(stats.len());
+        let mut scopes = Vec::with_capacity(stats.len());
+        let mut scope_runs = 0.0;
         for (name, stat) in stats {
             let pass = self.passes.entry(name).or_default();
-            let runs = stat.count.saturating_sub(pass.seen_count);
+            let runs = stat.count.saturating_sub(pass.seen_count) as f64;
             let read_ms = stat.total_ms - pass.seen_ms;
             pass.seen_count = stat.count;
             pass.seen_ms = stat.total_ms;
-            self.scope_runs += runs;
-            window.push((name, runs as f64, read_ms));
+            scope_runs += runs;
+            scopes.push((name, runs, read_ms));
         }
 
-        // What one scope costs: what a frame with the scopes takes over one
-        // without, shared among the scopes it ran. Taken over everything
-        // measured so far: it is a property of the clock lookup, not of the
-        // scene.
-        let scope_ms = if self.plain_frames == 0 || self.timed_frames == 0 || self.scope_runs == 0 {
-            0.0
-        } else {
-            let plain_ms = self.phase_ms[Phase::Render as usize] / plain_frames;
-            let timed_ms = self.timed_render_ms / self.timed_frames as f64;
-            (timed_ms - plain_ms).max(0.0) * self.timed_frames as f64 / self.scope_runs as f64
-        };
+        // What one scope costs: what a frame with the scopes took over one
+        // without, shared among the scopes it ran.
+        let window = std::mem::take(&mut self.window);
+        if window.plain_frames > 0 && window.timed_frames > 0 && scope_runs > 0.0 {
+            let plain_ms = window.plain_render_ms / f64::from(window.plain_frames);
+            let timed_ms = window.timed_render_ms / f64::from(window.timed_frames);
+            let estimate = (timed_ms - plain_ms) * f64::from(window.timed_frames) / scope_runs;
+            if self.scope_estimates.len() == SCOPE_ESTIMATES {
+                self.scope_estimates.pop_front();
+            }
+            self.scope_estimates.push_back(estimate);
+        }
+        let scope_ms = median(&self.scope_estimates).max(0.0);
 
         let timed_frames = self.timed_frames as f64;
-        for (name, runs, read_ms) in window {
+        for (name, runs, read_ms) in scopes {
             self.overhead_ms += runs * scope_ms;
             let pass = self.passes.entry(name).or_default();
             pass.net_ms += (read_ms - runs * scope_ms / 2.0).max(0.0);
@@ -219,6 +245,13 @@ impl Profile {
             plain_frames + timed_frames,
         ));
     }
+}
+
+/// The middle value (the upper of the two for an even count), or 0 for none.
+fn median(values: &VecDeque<f64>) -> f64 {
+    let mut sorted: Vec<f64> = values.iter().copied().collect();
+    sorted.sort_by(f64::total_cmp);
+    sorted.get(sorted.len() / 2).copied().unwrap_or(0.0)
 }
 
 fn total(kind: TimingKind, name: &str, total_ms: f64, count: f64) -> TimingTotal {

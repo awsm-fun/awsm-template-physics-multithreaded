@@ -379,8 +379,8 @@ every number sits under the thread that spent it, with its unit and its basis
   `timestamp-query`); expanded, one row per pass, slowest first. On Apple
   GPUs passes overlap, so the rows add up to more than the frame: expected.
 - **renderer (render worker)**: the render thread's CPU time per frame;
-  expanded, its four phases (read app state + interpolate, update
-  transforms, set camera, render) with awsm-renderer's per-pass CPU time
+  expanded, its four phases (read app state + interpolate, set
+  camera, update transforms, render) with awsm-renderer's per-pass CPU time
   nested under render, then **timing the passes**. The renderer's per-pass
   CPU timers are expensive in a worker, so they run on one frame in sixteen,
   and what they add to the average frame is listed as "timing the passes".

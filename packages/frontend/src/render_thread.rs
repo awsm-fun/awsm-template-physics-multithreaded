@@ -15,7 +15,8 @@
 //! alpha)`, one frame behind because physics runs on its own thread (see the
 //! `protocol` module docs). The camera comes from main through shared memory
 //! too ([`CameraRing`]). No per-frame messaging. Lighting is entirely the
-//! scene's (the loader instantiates its light nodes).
+//! scene's (the loader instantiates its light nodes); its clips, texture flows
+//! and particles advance each frame, before the bodies are written.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -117,8 +118,8 @@ pub fn start(payload: JsValue) -> Result<(), JsValue> {
             // across releases, so a browser that cached an older transcoder
             // (wasm included: the worker carries the query over to it) would
             // otherwise pair it with the new JS. Bump with awsm-renderer.
-            format!("{base}/workers/basis-worker.js?v=0.43.0"),
-            format!("{base}/vendor/basis/basis_transcoder.js?v=0.43.0"),
+            format!("{base}/workers/basis-worker.js?v=0.44.1"),
+            format!("{base}/vendor/basis/basis_transcoder.js?v=0.44.1"),
         ));
     }
     // The desired STARTUP anti-aliasing (main's stored Settings prefs) rides
@@ -229,7 +230,16 @@ async fn run(
         futures::join!(renderer.ensure_config_pipelines(), fetch_scene(&scene_url));
     let compiled =
         compiled.map_err(|e| JsValue::from_str(&format!("ensure_config_pipelines: {e}")))?;
-    let scene = scene.map_err(|e| JsValue::from_str(&format!("load scene {scene_url}: {e}")))?;
+    let mut scene =
+        scene.map_err(|e| JsValue::from_str(&format!("load scene {scene_url}: {e}")))?;
+    // The loader applies the scene's authored anti-aliasing. This app chooses
+    // AA itself (the Settings prefs the renderer was built with), so write that
+    // choice into the scene: the loader then keeps it and compiles nothing
+    // twice.
+    scene.post_process.anti_aliasing = awsm_renderer_scene::AntiAliasingConfig {
+        msaa: desired_aa.0,
+        smaa: desired_aa.1,
+    };
     tracing::info!(
         "render thread: loaded scene {scene_url} ({} nodes)",
         scene.nodes.len()
@@ -289,6 +299,9 @@ async fn run(
     )
     .await
     .map_err(|e| JsValue::from_str(&format!("load_scene_for_player: {e}")))?;
+    // The loader builds the scene's particle emitters; the host ticks them
+    // each frame (as it advances the clips), in the render loop below.
+    let mut particles = awsm_renderer_scene_loader::ParticleDriver::new(&loaded);
 
     // Lighting is whatever the scene authored — the loader instantiates every
     // light node (the `Sun`, plus any you add in the editor). No code-side lights.
@@ -585,10 +598,16 @@ async fn run(
         last_frame_us = Some(frame_us);
         // The span since the previous presented frame, for the missed-frame
         // count — added before the tick, so a reader that sees this frame's
-        // tick also sees its span.
-        if let Some(prev) = last_presented.replace(vsync_ms) {
-            motion.add_frame_span_us(((vsync_ms - prev) * 1000.0).round().max(0.0) as u64 as u32);
-        }
+        // tick also sees its span. The same span (ms) advances the clips and
+        // particles below; 0 on the first frame.
+        let frame_ms = match last_presented.replace(vsync_ms) {
+            Some(prev) => {
+                let span_ms = (vsync_ms - prev).max(0.0);
+                motion.add_frame_span_us((span_ms * 1000.0).round() as u64 as u32);
+                span_ms
+            }
+            None => 0.0,
+        };
         // Physics now has the whole frame period to simulate up to
         // `frame_us`; the next frame draws the result.
         motion.begin_frame(frame_us);
@@ -601,6 +620,16 @@ async fn run(
                 cam.radius = radius;
             }
         }
+        lap_ms = profile.lap(Phase::ReadApp, &perf, lap_ms);
+
+        // The scene's authored clips and texture UV flows, then its particles.
+        // Before the ball writes below, so physics has the last word on the
+        // slots it drives. (Don't animate a ball or its parents, though:
+        // `update_transforms` rewrites the slots of a subtree a clip moved,
+        // over the physics pose.)
+        let _ = r.update_animations(frame_ms);
+        particles.tick(r, (frame_ms / 1000.0) as f32);
+        lap_ms = profile.lap(Phase::Animate, &perf, lap_ms);
 
         let (pos, rot, late) = sample_at(motion.ring(), display_us);
         if late {

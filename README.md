@@ -186,7 +186,7 @@ runtime (the `wasm-bindgen-rayon` pattern — `packages/frontend/src/lib.rs`).
 | Thread | File | Responsibility |
 |---|---|---|
 | **Main** | `packages/frontend/src/main_thread.rs` | Owns the DOM (built with **Dominator**) + keyboard input, and the **WebAudio player** (`packages/frontend/src/audio.rs`). Spawns the render worker, the physics worker, and (on the physics worker's request) the task-pool workers. |
-| **Render** | `packages/frontend/src/render_thread.rs` | Hosts **awsm-renderer** on an `OffscreenCanvas`, loads `scene.toml` via `load_scene_for_player`, derives the collider list (`derive_physics`), and every frame publishes its frame time (pacing physics), **interpolates** each body's pose at the previous frame's time and writes it into the transform arena. |
+| **Render** | `packages/frontend/src/render_thread.rs` | Hosts **awsm-renderer** on an `OffscreenCanvas`, loads `scene.toml` via `load_scene_for_player`, derives the collider list (`derive_physics`), and every frame publishes its frame time (pacing physics), advances the scene's clips, texture flows and particles, **interpolates** each body's pose at the previous frame's time and writes it into the transform arena (after the clips, so physics wins on the bodies it drives). |
 | **Physics** | `packages/frontend/src/physics_thread.rs` | Runs a **Box3D** world built from the scene's colliders (static table + walls, dynamic ball) at a **fixed step** (`SIM_HZ`, 240 Hz default), catching up to **the render thread's published frame time** each frame, polls input from shared memory, publishes each step’s pose into shared pose rings, and emits audio cues from contact events. |
 | **Task pool ×N** | `packages/frontend/src/physics_tasks.rs` | `hardware_concurrency - 3` (≤4) workers parked on a futex semaphore. Box3D's `b3ParallelFor` enqueues solver tasks into a shared slot array; the pool (and the stepping thread itself) CAS-claim and execute them. Pure compute — no JS, no messages. |
 
@@ -388,9 +388,9 @@ every number sits under the thread that spent it, with its unit and its basis
   `timestamp-query`); expanded, one row per pass, slowest first. On Apple
   GPUs passes overlap, so the rows add up to more than the frame: expected.
 - **renderer (render worker)**: the render thread's CPU time per frame;
-  expanded, its four phases (read app state + interpolate, set
-  camera, update transforms, render) with awsm-renderer's CPU scopes nested
-  under render, grouped by `profiling::cpu_scope_kind` into **prepare**
+  expanded, its five phases (read app state + interpolate, animations +
+  particles, set camera, update transforms, render) with awsm-renderer's
+  CPU scopes nested under render, grouped by `profiling::cpu_scope_kind` into **prepare**
   (uploads, bind groups, … before the first pass), **passes**, **submit**
   and **hooks** (when any ran), each listing its scopes slowest first (those
   under 1 µs folded into one line), then **outside the scopes**: the rest of
@@ -531,6 +531,9 @@ hear lines up with what you see.
    put it in `dist/` same-origin (COEP blocks cross-origin fetches), and
    `task dev`'s side media server serves `media/` as-is. External scene
    assets go into the `assets` `HashMap` passed to `load_scene_for_player`.
+   The scene's lights, post-processing, clips, texture UV flows and particle
+   emitters all play; its authored anti-aliasing does not — the player's
+   Settings choice is written into the scene before the load.
 3. Author **collider nodes** in your scene for anything physical. They're derived
    automatically (`render_thread::derive_physics`) — the node named `Ball` is the
    dynamic body; rename/extend that convention as needed and adjust the camera
@@ -545,7 +548,7 @@ git submodule at `vendor/box3d` and built by the local `packages/box3d-sys` crat
 [Box3D — C physics inside the same wasm module](#box3d--c-physics-inside-the-same-wasm-module)
 and `BOX3D.md` for the integration reference.
 
-All Rust crates are from **crates.io** — `awsm-renderer` family `0.11`,
+All Rust crates are from **crates.io** — `awsm-renderer` family `0.44`,
 `awsm-audio` family `2.5`, `dominator` / `futures-signals`, `glam` `0.32`,
 `libm` (the wasm libc shim's transcendentals) — with **one** exception:
 `dominator` is redirected via `[patch.crates-io]` to an upstream git rev. The

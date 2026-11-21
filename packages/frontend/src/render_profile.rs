@@ -30,14 +30,19 @@ pub enum Phase {
     /// camera ring, sampling + interpolating the published steps, minting
     /// dropped balls.
     ReadApp,
+    /// The scene's clips + texture UV flows (`update_animations`) and its
+    /// particles (`ParticleDriver::tick`). Runs inside `ReadApp`, before the
+    /// ball writes.
+    Animate,
     SetCamera,
     UpdateTransforms,
     /// `AwsmRenderer::render`: encoding every pass and submitting.
     Render,
 }
 
-pub const PHASE_NAMES: [&str; 4] = [
+pub const PHASE_NAMES: [&str; 5] = [
     "read app state + interpolate",
+    "animations + particles",
     "set camera",
     "update transforms",
     "render (encode + submit)",
@@ -53,7 +58,7 @@ pub struct Profile {
     published_at_ms: f64,
     /// Running totals (ms) of each phase over the frames timed, and those
     /// frames.
-    phase_ms: [f64; 4],
+    phase_ms: [f64; 5],
     frames: u64,
 }
 

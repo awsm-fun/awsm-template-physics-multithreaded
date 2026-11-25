@@ -51,8 +51,8 @@ awsm-renderer-scene-loader = { version = "0.46.0", features = ["http"] }
 #                           scopes and GPU passes) and the panel itself
 # This one crate is both the page and the workers, so it turns on both sides'
 # features.
-awsm-renderer-settings = { git = "https://github.com/awsm-fun/awsm-renderer-kit", tag = "v0.1.1", features = ["renderer", "scene", "ui"] }
-awsm-renderer-stats = { git = "https://github.com/awsm-fun/awsm-renderer-kit", tag = "v0.1.1", features = ["renderer", "ui"] }
+awsm-renderer-settings = { git = "https://github.com/awsm-fun/awsm-renderer-kit", tag = "v0.1.2", features = ["renderer", "scene", "ui"] }
+awsm-renderer-stats = { git = "https://github.com/awsm-fun/awsm-renderer-kit", tag = "v0.1.2", features = ["renderer", "ui"] }
 
 # ── Audio (awsm-audio runtime) ───────────────────────────────────────────────
 # `awsm-audio-player` plays a saved awsm-audio project live; `awsm-audio-schema`

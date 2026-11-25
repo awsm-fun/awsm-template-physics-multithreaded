@@ -99,11 +99,10 @@ pub fn time_diff_us(a: u32, b: u32) -> i32 {
     a.wrapping_sub(b) as i32
 }
 
-/// The Stats panel's breakdowns that cost something to measure, as bits in
-/// [`BodyMotion::detail`]: main sets a group's bit while that group is expanded
-/// (and the panel open), and the workers measure the breakdown only then.
-pub const DETAIL_GPU: u32 = 1 << 0;
-pub const DETAIL_RENDERER: u32 = 1 << 1;
+/// The Stats panel's physics breakdown costs something to measure, so the
+/// physics thread times its step phases only while this bit is set in
+/// [`BodyMotion::detail`]. The render worker sets it while the panel shows the
+/// physics group expanded (its stats collector knows the open groups).
 pub const DETAIL_PHYSICS: u32 = 1 << 2;
 
 /// The phases of one physics step the Stats panel lists (while its physics
@@ -474,44 +473,20 @@ pub struct BodyMotion {
     /// 0 until render has stored its first `frame_time_us`, then 1 forever.
     /// Until then physics runs on its own clock.
     frame_time_valid: AtomicU32,
-    /// Frames render drew while the newest published step was still older
-    /// than the frame's display time (physics late with its burst), wrapping.
-    /// The Stats panel shows them as "late frames".
-    app_late: AtomicU32,
-    /// Accumulated render-thread CPU time, in MICROSECONDS (wrapping): how long
-    /// each frame's work — interpolation, transform update, encode + submit —
-    /// took on the render thread, summed across frames. The stats panel divides
-    /// its delta by the `frame_tick` delta for avg ms/frame: a real workload
-    /// metric, unlike fps, which is vsync-capped and monitor-dependent. GPU
-    /// time is NOT included (the submit returns before the GPU finishes).
-    frame_work_us: AtomicU32,
     /// Accumulated physics-thread CPU time, in MICROSECONDS (wrapping): the
     /// full cost of each fixed step — input poll, `b3World_Step`, contact/hit
-    /// classification, pose publish — summed across steps. The stats panel
-    /// divides its delta by the step-count delta for avg ms/step.
+    /// classification, pose publish — summed across steps. The render
+    /// worker's stats divide its delta by the step-count delta for avg
+    /// ms/step.
     step_work_us: AtomicU32,
-    /// GPU frame time, accumulated, in MICROSECONDS (wrapping): the renderer's
-    /// running total of measured whole-frame GPU time
-    /// (`awsm_renderer::profiling::gpu_frame_timing`, timestamp queries), as
-    /// last published by the render thread. With [`Self::gpu_samples`] the
-    /// stats panel gets avg GPU ms/frame over its window — the number that
-    /// says whether a frame can make vsync, which the CPU `frame_work_us`
-    /// can't (the submit returns long before the GPU finishes).
-    gpu_total_us: AtomicU32,
-    /// How many GPU frame samples [`Self::gpu_total_us`] sums (wrapping). The
-    /// readback is single-buffered, so this counts fewer than `frame_tick`.
-    /// Stays 0 on a device without `timestamp-query`.
-    gpu_samples: AtomicU32,
-    /// Accumulated time between presented frames, in MICROSECONDS (wrapping):
-    /// each frame adds the gap between its rAF timestamp and the previous
-    /// presented frame's. Diffed with `frame_tick`, the stats panel gets the
-    /// span a window's frames covered, and so how many display refreshes went
-    /// by with no new frame (see `refresh::Missed`). Added BEFORE the frame's
-    /// tick bump, at the start of the frame.
-    frame_span_us: AtomicU32,
-    /// Written by main: the `DETAIL_*` bits of the Stats groups that are
-    /// expanded. Render and physics read it once per frame.
+    /// Written by render: [`DETAIL_PHYSICS`] while the Stats panel's physics
+    /// group is expanded. Physics reads it once per frame.
     detail: AtomicU32,
+    /// Written by physics once, if it runs a task pool: the
+    /// [`TaskPool`](crate::physics_tasks::TaskPool)'s address and its worker
+    /// count, for the render worker's stats (the solver's work split).
+    pool_addr: AtomicU32,
+    pool_workers: AtomicU32,
     /// Physics side, only while [`DETAIL_PHYSICS`] is set: running totals of
     /// each [`STEP_PHASES`] phase in NANOSECONDS (wrapping), and the steps
     /// they cover. Republished a few times a second, not per step, under a
@@ -530,27 +505,38 @@ impl BodyMotion {
             frame_tick: AtomicU32::new(0),
             frame_time_us: AtomicU32::new(0),
             frame_time_valid: AtomicU32::new(0),
-            app_late: AtomicU32::new(0),
-            frame_work_us: AtomicU32::new(0),
             step_work_us: AtomicU32::new(0),
-            gpu_total_us: AtomicU32::new(0),
-            gpu_samples: AtomicU32::new(0),
-            frame_span_us: AtomicU32::new(0),
             detail: AtomicU32::new(0),
+            pool_addr: AtomicU32::new(0),
+            pool_workers: AtomicU32::new(0),
             step_phase_version: AtomicU32::new(0),
             step_phase_ns: [const { AtomicU32::new(0) }; STEP_PHASES.len()],
             step_phase_steps: AtomicU32::new(0),
         }
     }
 
-    /// Main side: which Stats breakdowns to measure (`DETAIL_*` bits).
+    /// Render side: which Stats breakdowns to measure (`DETAIL_*` bits).
     pub fn set_detail(&self, bits: u32) {
         self.detail.store(bits, Ordering::Relaxed);
     }
 
-    /// Worker side: the `DETAIL_*` bits main last set.
+    /// Physics side: the `DETAIL_*` bits render last set.
     pub fn detail(&self) -> u32 {
         self.detail.load(Ordering::Relaxed)
+    }
+
+    /// Physics side: the task pool it runs (its address in the shared memory
+    /// and its worker count), published once for the render worker's stats.
+    pub fn set_pool(&self, addr: usize, workers: u32) {
+        self.pool_workers.store(workers, Ordering::Relaxed);
+        self.pool_addr.store(addr as u32, Ordering::Release);
+    }
+
+    /// Render side: the task pool's address and worker count, once physics
+    /// has one.
+    pub fn pool(&self) -> Option<(usize, u32)> {
+        let addr = self.pool_addr.load(Ordering::Acquire);
+        (addr != 0).then(|| (addr as usize, self.pool_workers.load(Ordering::Relaxed)))
     }
 
     /// Physics side: publish the running per-phase totals (ms) and the steps
@@ -569,7 +555,7 @@ impl BodyMotion {
             .store(v.wrapping_add(2), Ordering::Relaxed);
     }
 
-    /// Stats side: `(per-phase ns, steps)`, all wrapping; `None` if a publish
+    /// Render (stats) side: `(per-phase ns, steps)`, all wrapping; `None` if a publish
     /// kept racing the read (the next sample gets it).
     pub fn step_phases(&self) -> Option<([u32; STEP_PHASES.len()], u32)> {
         for _ in 0..64 {
@@ -587,54 +573,6 @@ impl BodyMotion {
             }
         }
         None
-    }
-
-    /// Render side: publish the renderer's cumulative GPU frame time (µs) and
-    /// sample count. Stored as absolute (wrapping) values — readers diff them.
-    pub fn set_gpu_totals(&self, total_us: u32, samples: u32) {
-        self.gpu_total_us.store(total_us, Ordering::Relaxed);
-        self.gpu_samples.store(samples, Ordering::Relaxed);
-    }
-
-    /// Stats side: `(total GPU µs, samples)`, both wrapping — diff two reads
-    /// for the window's average GPU frame time.
-    pub fn gpu_totals(&self) -> (u32, u32) {
-        (
-            self.gpu_total_us.load(Ordering::Relaxed),
-            self.gpu_samples.load(Ordering::Relaxed),
-        )
-    }
-
-    /// Render side: count a frame drawn before physics finished its burst.
-    pub fn note_app_late(&self) {
-        self.app_late.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Stats side: frames drawn with physics late (wrapping — diff two reads).
-    pub fn app_late(&self) -> u32 {
-        self.app_late.load(Ordering::Relaxed)
-    }
-
-    /// Render side: add one frame's CPU work time (µs) to the running total.
-    pub fn add_frame_work_us(&self, us: u32) {
-        self.frame_work_us.fetch_add(us, Ordering::Relaxed);
-    }
-
-    /// Accumulated render-thread work time (µs, wrapping) — diff two reads and
-    /// divide by the `frame_tick` delta for avg time per frame.
-    pub fn frame_work_us(&self) -> u32 {
-        self.frame_work_us.load(Ordering::Relaxed)
-    }
-
-    /// Render side: add the interval (µs) since the previous presented frame.
-    pub fn add_frame_span_us(&self, us: u32) {
-        self.frame_span_us.fetch_add(us, Ordering::Relaxed);
-    }
-
-    /// Accumulated time between presented frames (µs, wrapping) — diff two
-    /// reads for the span a window's frames covered.
-    pub fn frame_span_us(&self) -> u32 {
-        self.frame_span_us.load(Ordering::Relaxed)
     }
 
     /// Physics side: add one fixed step's CPU work time (µs) to the total.
@@ -923,7 +861,9 @@ pub enum AudioMsg {
     },
 }
 
-/// Render thread → main thread.
+/// Render thread → main thread. (The Settings' and the Stats panel's
+/// messages — `aa-compile-*`, `stats` — are awsm-renderer-kit's own, posted
+/// alongside these; main hands them to the panels first.)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "msg", rename_all = "kebab-case")]
 pub enum RenderMsg {
@@ -935,60 +875,8 @@ pub enum RenderMsg {
     PhysicsInit(PhysicsInit),
     /// The first few frames have rendered — the sphere is on screen.
     Ready,
-    /// GPU capability facts the render worker learns at startup, so main can
-    /// seed the resolution scale and cap the backing store. `is_fallback` = a
-    /// software adapter (can't push pixels → main starts conservative);
-    /// `max_texture_dim` = the device's max 2D texture size (a huge display's
-    /// backing store can't exceed it). Posted once, before the scene load.
-    GpuInfo {
-        is_fallback: bool,
-        max_texture_dim: u32,
-    },
-    /// The render worker began recompiling the AA-dependent pipelines for a
-    /// Settings anti-aliasing change. Main shows the blocking "compiling
-    /// pipelines" modal until [`RenderMsg::AaCompileDone`]. Only the *first*
-    /// switch in each direction actually compiles — the renderer caches
-    /// variants — so later toggles flash the modal for a frame at most.
-    AaCompileStart { msaa: bool, smaa: bool },
-    /// A progress line for the in-flight AA recompile (mirrors the gpu-commit
-    /// callback), shown inside the modal.
-    AaCompileProgress { message: String },
-    /// The AA recompile finished — success or failure (failure also posts
-    /// [`RenderMsg::Error`]); main hides the modal either way.
-    AaCompileDone,
     /// Something failed in the render worker.
     Error { message: String },
-    /// The renderer breakdowns the Stats panel asked for (see
-    /// [`BodyMotion::detail`]), as running totals: posted a few times a
-    /// second, and only while asked.
-    Timings { entries: Vec<TimingTotal> },
-}
-
-/// What a [`TimingTotal`] times.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum TimingKind {
-    /// One of the render worker's own frame phases.
-    RendererPhase,
-    /// awsm-renderer's CPU scopes inside `render()`, by
-    /// `profiling::cpu_scope_kind`: before the first pass, one pass, the
-    /// submit, a render hook.
-    RendererPrep,
-    RendererPass,
-    RendererSubmit,
-    RendererHook,
-    /// The GPU's time for one pass.
-    GpuPass,
-}
-
-/// A running total: `total_ms` over `count` frames. The stats sampler diffs
-/// two of them for the mean over its window.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TimingTotal {
-    pub kind: TimingKind,
-    pub name: String,
-    pub total_ms: f64,
-    pub count: f64,
 }
 
 /// Main thread → render thread: the user clicked the canvas at the given NDC
@@ -1000,32 +888,6 @@ pub struct TimingTotal {
 #[serde(tag = "drop", rename_all = "kebab-case")]
 pub enum DropMsg {
     Ball { ndc_x: f32, ndc_y: f32 },
-}
-
-/// Main thread → render thread: a runtime quality change. Anti-aliasing is a
-/// renderer-*pipeline* setting — the MSAA sample count is baked into every
-/// render pipeline + its targets, and SMAA is a post pass compiled into the
-/// effects shader — so main can't apply it directly. It sends the desired flags
-/// and the render worker calls `set_anti_aliasing` + `commit_load` (which
-/// recompiles only the new config's variants; already-seen configs are cached,
-/// so toggling back is cheap). Cold path — one message per Settings toggle.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "quality", rename_all = "kebab-case")]
-pub enum QualityMsg {
-    /// Enable/disable MSAA 4× and the SMAA post pass (independent toggles).
-    AntiAlias { msaa: bool, smaa: bool },
-}
-
-/// Main thread → render thread: the canvas element's size changed (main's
-/// `ResizeObserver` — only main sees layout). The render worker owns the
-/// transferred `OffscreenCanvas`, so it applies the new **device-pixel**
-/// backing size there; the per-frame camera update picks up the new aspect.
-/// Without this the backing store stays at its initial size and the browser
-/// stretches it — circles render as ovals after any window resize.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "resize", rename_all = "kebab-case")]
-pub enum ResizeMsg {
-    Canvas { width: u32, height: u32 },
 }
 
 /// Radians of camera yaw (and pitch) per CSS pixel of drag.

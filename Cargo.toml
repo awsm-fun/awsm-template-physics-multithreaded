@@ -36,9 +36,23 @@ box3d-sys = { path = "packages/box3d-sys" }
 #                              shipped game uses; also re-exports the Basis KTX2
 #                              transcoder config as `scene_loader::basis`, so no
 #                              direct -codec-basis dep.
-awsm-renderer = "0.45.0"
-awsm-renderer-scene = "0.45.0"
-awsm-renderer-scene-loader = { version = "0.45.0", features = ["http"] }
+awsm-renderer = "0.46.0"
+awsm-renderer-scene = "0.46.0"
+awsm-renderer-scene-loader = { version = "0.46.0", features = ["http"] }
+
+# ── Settings and stats, shared by every awsm-renderer app ───────────────────
+# awsm-renderer-kit (https://github.com/awsm-fun/awsm-renderer-kit):
+#   awsm-renderer-settings  the anti-aliasing modes (TAA included), the
+#                           resolution policy, storage + URL flags, applying a
+#                           mode behind the "compiling pipelines" overlay, the
+#                           GPU probe, and the Settings modal (web-sys)
+#   awsm-renderer-stats     the stats panel's numbers (the render worker's
+#                           collector: frame windows, smoothing, renderer CPU
+#                           scopes and GPU passes) and the panel itself
+# This one crate is both the page and the workers, so it turns on both sides'
+# features.
+awsm-renderer-settings = { git = "https://github.com/awsm-fun/awsm-renderer-kit", tag = "v0.1.1", features = ["renderer", "scene", "ui"] }
+awsm-renderer-stats = { git = "https://github.com/awsm-fun/awsm-renderer-kit", tag = "v0.1.1", features = ["renderer", "ui"] }
 
 # ── Audio (awsm-audio runtime) ───────────────────────────────────────────────
 # `awsm-audio-player` plays a saved awsm-audio project live; `awsm-audio-schema`

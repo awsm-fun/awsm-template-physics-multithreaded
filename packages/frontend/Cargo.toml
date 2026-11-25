@@ -22,6 +22,10 @@ awsm-renderer.workspace = true
 awsm-renderer-scene.workspace = true
 awsm-renderer-scene-loader.workspace = true
 
+# ── Settings + stats (awsm-renderer-kit) ─────────────────────────────────────
+awsm-renderer-settings.workspace = true
+awsm-renderer-stats.workspace = true
+
 # ── Physics ──────────────────────────────────────────────────────────────────
 # Box3D (Erin Catto's C physics engine, vendored at vendor/box3d) compiled by
 # packages/box3d-sys INTO THIS SAME wasm module — one shared memory, no bridge.
@@ -64,21 +68,11 @@ features = [
     "Element",
     "HtmlElement",
     "HtmlCanvasElement",
-    "HtmlInputElement",
-    "HtmlSelectElement",
     "OffscreenCanvas",
     "Location",
     "UrlSearchParams",
-    # Resolution-scale UI (the fill-rate slider): a persisted preference
-    # (Storage), a touch-device default (MediaQueryList), and the GPU facts the
-    # render worker reports so main can seed the scale + cap the backing store.
-    "Storage",
-    "MediaQueryList",
-    "Gpu",
-    "GpuAdapter",
-    "GpuAdapterInfo",
-    "GpuSupportedLimits",
-    "Navigator",
+    # (The Settings and Stats panels — storage, the GPU probe, the canvas
+    # observer — bring their own web-sys features: awsm-renderer-kit.)
     "WorkerNavigator",
     "WorkerGlobalScope",
     "DedicatedWorkerGlobalScope",
@@ -92,9 +86,6 @@ features = [
     "Url",
     "KeyboardEvent",
     "MouseEvent",
-    "ResizeObserver",
-    "ResizeObserverEntry",
-    "DomRectReadOnly",
     "PointerEvent",
     "WheelEvent",
     "Performance",

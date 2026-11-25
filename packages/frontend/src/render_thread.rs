@@ -22,6 +22,14 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use awsm_renderer::buffer::shared_arena::foreign_write;
+use awsm_renderer::transforms::TransformKey;
+use awsm_renderer_settings::{
+    apply_anti_aliasing, post_to_page, scene_anti_aliasing, AaMode, SettingsToPage,
+    SettingsToWorker,
+};
+use awsm_renderer_stats::{
+    post_report, stats_logging, FrameInput, RendererTimings, StatsCollector, StatsToWorker,
+};
 use glam::{Mat4, Quat, Vec3};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -29,10 +37,39 @@ use web_sys::js_sys;
 
 use crate::protocol::{
     abs_time_us, time_diff_us, BallMotions, BodyMotion, Bracket, CameraRing, ColliderInit,
-    ColliderShapeMsg, DropMsg, OrbitCamera, PhysicsInit, PoseRing, QualityMsg, RenderMsg,
-    ResizeMsg, ROLE_FLOOR, STEP_US,
+    ColliderShapeMsg, DropMsg, OrbitCamera, PhysicsInit, PoseRing, RenderMsg, DETAIL_PHYSICS,
+    ROLE_FLOOR, STEP_US,
 };
-use crate::render_profile::{Phase, Profile};
+use crate::stats::{self, Phase, PhysicsStats};
+
+thread_local! {
+    /// The Stats panel's numbers (awsm-renderer-stats), from the worker's
+    /// start: the page's `stats-view` and `stats-page` can arrive before the
+    /// renderer exists.
+    static STATS: RefCell<StatsCollector> = RefCell::new(StatsCollector::new(stats::config()));
+}
+
+/// The awsm-renderer release the vendored Basis transcoder files came with,
+/// appended to their URLs as `?v=…`: those files keep their names from one
+/// release to the next, so a browser that cached an older transcoder (wasm
+/// included: the worker carries the query over to it) would otherwise pair
+/// it with the new JS. Bump it together with awsm-renderer in Cargo.toml.
+const BASIS_VERSION: &str = "0.46.0";
+
+/// A drawn ball that moves farther than this in one frame (m) teleported
+/// (physics' fall-through respawn): under TAA its motion history is reset,
+/// so the respawned ball does not reproject the history of where it fell
+/// from. A ball never moves this far in a frame on its own (its speed is
+/// capped well below it).
+const TELEPORT_JUMP_M: f32 = 1.5;
+
+/// What a click needs to become a dropped ball: the shared drop block and the
+/// tabletop (both known once the scene is loaded).
+struct DropTarget {
+    balls: &'static BallMotions,
+    floor: Option<([f32; 3], [f32; 3])>,
+    ball_radius: f32,
+}
 
 /// The boxed RAF callback, self-referenced so the render loop can reschedule
 /// itself each frame (and stays alive for the worker's lifetime). The `f64`
@@ -114,27 +151,20 @@ pub fn start(payload: JsValue) -> Result<(), JsValue> {
             .unwrap_or_default();
         let base = app_base.trim_end_matches('/');
         configure(BasisWorkerConfig::player(
-            // `?v=` names the vendored build: these files keep their names
-            // across releases, so a browser that cached an older transcoder
-            // (wasm included: the worker carries the query over to it) would
-            // otherwise pair it with the new JS. Bump with awsm-renderer.
-            format!("{base}/workers/basis-worker.js?v=0.45.0"),
-            format!("{base}/vendor/basis/basis_transcoder.js?v=0.45.0"),
+            format!("{base}/workers/basis-worker.js?v={BASIS_VERSION}"),
+            format!("{base}/vendor/basis/basis_transcoder.js?v={BASIS_VERSION}"),
         ));
     }
-    // The desired STARTUP anti-aliasing (main's stored Settings prefs) rides
-    // the spawn payload so the renderer BUILDS with it — compiling exactly the
-    // variants this session needs. (Previously the renderer built at its own
-    // default and main posted a reconcile after `Ready`, which recompiled the
-    // whole pipeline set right as the game became playable — a long stall on
-    // every load for any device whose prefs differ, i.e. every touch device.)
-    let get_bool = |key: &str| {
-        js_sys::Reflect::get(&payload, &JsValue::from_str(key))
-            .ok()
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-    };
-    let desired_aa = (get_bool("msaa"), get_bool("smaa"));
+    // The STARTUP anti-aliasing mode (main's Settings: the stored choice,
+    // `?aa=`, or the device default) rides the spawn payload as its id, so
+    // the renderer BUILDS with it — compiling exactly the variants this
+    // session needs, with no reconcile recompile after `Ready`.
+    let aa_id = js_sys::Reflect::get(&payload, &JsValue::from_str("aa"))
+        .ok()
+        .and_then(|v| v.as_string())
+        .unwrap_or_default();
+    let desired_aa = AaMode::from_id(&aa_id)
+        .ok_or_else(|| JsValue::from_str(&format!("render worker: unknown aa mode {aa_id:?}")))?;
     // The camera ring main writes (see `CameraRing`): leaked by main in the
     // same `WebAssembly.Memory`, so its address is valid here.
     let camera_ptr = js_sys::Reflect::get(&payload, &JsValue::from_str("camera_ptr"))
@@ -144,7 +174,23 @@ pub fn start(payload: JsValue) -> Result<(), JsValue> {
         .ok_or_else(|| JsValue::from_str("render worker: no camera_ptr"))?;
     // SAFETY: see above — a live, never-freed `CameraRing`.
     let camera_ring: &'static CameraRing = unsafe { &*(camera_ptr as usize as *const CameraRing) };
-    let canvas_handle = canvas.clone();
+
+    // This worker's messages from main, from now on (the bootstrap's init
+    // handler has done its job): the stats panel talks to the collector even
+    // while the scene loads, and Settings changes made meanwhile wait in
+    // `pending_aa` for the render loop.
+    let camera = Rc::new(RefCell::new(OrbitCamera::start()));
+    let pending_aa: Rc<Cell<Option<AaMode>>> = Rc::new(Cell::new(None));
+    let drop_target: Rc<RefCell<Option<DropTarget>>> = Rc::new(RefCell::new(None));
+    install_render_input(
+        camera.clone(),
+        canvas.clone(),
+        drop_target.clone(),
+        pending_aa.clone(),
+    )?;
+    // The panel's "starting…" until the scene is on screen.
+    post_report(STATS.with_borrow(StatsCollector::placeholder));
+
     post_progress("render worker: requesting WebGPU device…");
     let gpu =
         navigator_gpu().ok_or_else(|| JsValue::from_str("render worker: no navigator.gpu"))?;
@@ -152,7 +198,17 @@ pub fn start(payload: JsValue) -> Result<(), JsValue> {
         .with_device_request_limits(DeviceRequestLimits::max_all());
 
     wasm_bindgen_futures::spawn_local(async move {
-        if let Err(err) = run(gpu_builder, canvas_handle, origin, desired_aa, camera_ring).await {
+        let started = run(
+            gpu_builder,
+            origin,
+            desired_aa,
+            camera_ring,
+            camera,
+            pending_aa,
+            drop_target,
+        )
+        .await;
+        if let Err(err) = started {
             tracing::error!("render thread: {err:?}");
             post_to_main(&RenderMsg::Error {
                 message: format!("{err:?}"),
@@ -162,22 +218,18 @@ pub fn start(payload: JsValue) -> Result<(), JsValue> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     gpu_builder: awsm_renderer::core::renderer::AwsmRendererWebGpuBuilder,
-    canvas: web_sys::OffscreenCanvas,
     origin: String,
-    desired_aa: (bool, bool),
+    desired_aa: AaMode,
     camera_ring: &'static CameraRing,
+    camera: Rc<RefCell<OrbitCamera>>,
+    pending_aa: Rc<Cell<Option<AaMode>>>,
+    drop_target: Rc<RefCell<Option<DropTarget>>>,
 ) -> Result<(), JsValue> {
     use awsm_renderer::camera::CameraParams;
     use awsm_renderer::AwsmRendererBuilder;
-
-    // Tell main the GPU's capabilities up front (before the slow scene load)
-    // so it can seed the resolution scale — a software/fallback adapter can't
-    // push pixels, so main starts it conservative — and cap the canvas backing
-    // store to the device's max texture size. Independent, lightweight adapter
-    // request: cheap, and decoupled from the renderer's own device build below.
-    report_gpu_info().await;
 
     // The builder reports its coarse boot phases through this handler — wire
     // them to the loading screen. Since the deferred-boot renderer, `build()`
@@ -185,15 +237,13 @@ async fn run(
     // `ensure_config_pipelines` step below), so only `Init` — device +
     // core GPU resources — takes visible time here.
     let mut renderer = AwsmRendererBuilder::new(gpu_builder)
-        .with_anti_aliasing(aa_config(desired_aa))
+        .with_anti_aliasing(desired_aa.to_anti_aliasing())
         // GPU timing for the Stats panel's GPU group: `Frame` tier =
         // timestamp queries on every pass, folded into one whole-frame span
         // (cheap; silently off without `timestamp-query`). The CPU tier is
-        // `Off` except while the renderer group is open (`render_profile`).
-        .with_logging(awsm_renderer::debug::AwsmRendererLogging {
-            gpu: awsm_renderer::debug::TimingTier::Frame,
-            ..Default::default()
-        })
+        // `Off` except while the renderer group is open (the stats
+        // collector's `begin_renderer_frame` switches it).
+        .with_logging(stats_logging())
         .with_phase_handler(|phase| {
             use awsm_renderer::RendererLoadingPhase as P;
             let message = match phase {
@@ -206,8 +256,8 @@ async fn run(
         .await
         .map_err(|e| JsValue::from_str(&format!("build renderer: {e}")))?;
     post_progress(&format!(
-        "render worker: WebGPU device + renderer ready (msaa {}, smaa {})",
-        desired_aa.0, desired_aa.1
+        "render worker: WebGPU device + renderer ready (anti-aliasing: {})",
+        AaMode::from_anti_aliasing(&renderer.anti_aliasing).label()
     ));
 
     // Shared mode must be enabled BEFORE the load so every scene node gets an
@@ -236,10 +286,7 @@ async fn run(
     // AA itself (the Settings prefs the renderer was built with), so write that
     // choice into the scene: the loader then keeps it and compiles nothing
     // twice.
-    scene.post_process.anti_aliasing = awsm_renderer_scene::AntiAliasingConfig {
-        msaa: desired_aa.0,
-        smaa: desired_aa.1,
-    };
+    scene.post_process.anti_aliasing = scene_anti_aliasing(&renderer.anti_aliasing);
     tracing::info!(
         "render thread: loaded scene {scene_url} ({} nodes)",
         scene.nodes.len()
@@ -435,26 +482,19 @@ async fn run(
     // ── Render loop: orbit camera + interpolated ball ───────────────────────
     // Main owns the camera (it has the pointer events) and writes it into the
     // shared `CameraRing` once per main-thread frame; each frame we copy one
-    // slot of it into this, the camera we draw and unproject clicks with.
-    #[allow(clippy::arc_with_non_send_sync)]
-    let camera = Rc::new(RefCell::new(OrbitCamera::start()));
-    // The onmessage handler handles [`DropMsg`] (click → unproject onto the
-    // table through the camera last drawn → drop request), resizes and
-    // anti-aliasing changes.
-    // Runtime anti-aliasing: main posts a `QualityMsg` on a Settings toggle;
-    // the input handler drops the requested (msaa, smaa) here, and the render
-    // loop applies it off the render path (see the RAF closure). `reconfiguring`
-    // gates frames out while the async recompile holds the renderer borrow.
-    let pending_aa: Rc<Cell<Option<(bool, bool)>>> = Rc::new(Cell::new(None));
-    let reconfiguring: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-    install_render_input(
-        camera.clone(),
-        canvas.clone(),
+    // slot of it into `camera`, the camera we draw and unproject clicks with.
+    // Clicks can become balls from now on (see `install_render_input`).
+    *drop_target.borrow_mut() = Some(DropTarget {
         balls,
         floor,
         ball_radius,
-        pending_aa.clone(),
-    )?;
+    });
+    // Runtime anti-aliasing: main posts the kit's `anti-alias` on a Settings
+    // change; the input handler leaves the mode in `pending_aa`, and the
+    // render loop applies it off the render path (see the RAF closure).
+    // `reconfiguring` gates frames out while the async recompile holds the
+    // renderer.
+    let reconfiguring: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
     // `Option` so an async anti-aliasing reconfig can take the renderer OUT of
     // the cell for the duration of its awaits (rather than holding the RefCell
@@ -473,20 +513,25 @@ async fn run(
     // this frame draws at, minus one step — `None` on the first frame. See
     // the `protocol` module docs.
     let mut last_frame_us: Option<u32> = None;
-    // The previous PRESENTED frame's vsync timestamp, for the stats panel's
-    // missed-frame count (`BodyMotion::add_frame_span_us`).
+    // The previous PRESENTED frame's vsync timestamp: the clips and
+    // particles advance by the time since it.
     let mut last_presented: Option<f64> = None;
     let mut frame_count: u32 = 0;
-    // Last GPU-timing sample count published to the stats panel.
-    let mut gpu_samples_seen: u64 = 0;
-    // The Stats panel's renderer/GPU breakdowns, only while it asks.
-    let mut profile = Profile::default();
-    // One arena binding per minted (dropped-ball) visual duplicate.
-    let mut ball_bindings: Vec<awsm_renderer::buffer::shared_arena::SlotBinding> = Vec::new();
+    // The Stats panel's physics group (the collector itself is `STATS`).
+    let mut physics_stats = PhysicsStats::default();
+    // One arena binding per minted (dropped-ball) visual duplicate, with its
+    // transform (for a teleport's motion-history reset).
+    let mut ball_bindings: Vec<(
+        awsm_renderer::buffer::shared_arena::SlotBinding,
+        TransformKey,
+    )> = Vec::new();
+    // Where each ball was drawn last frame (the player first, then the
+    // dropped balls), to spot a teleport.
+    let mut drawn_at: Vec<Vec3> = Vec::new();
 
     // Worker-scope `performance` for the frame-work clock. This is NOT frame
     // pacing (the vsync timestamp does that) — it measures how long this
-    // thread's work takes, published for the Stats panel's renderer group.
+    // thread's work takes, for the Stats panel's renderer group.
     let perf = js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("performance"))
         .ok()
         .and_then(|p| p.dyn_into::<web_sys::Performance>().ok())
@@ -511,7 +556,7 @@ async fn run(
         // the renderer OUT of the cell for the awaits (so no RefCell borrow is
         // held across them); the `reconfiguring` guard keeps every frame off the
         // renderer until it's put back. `take()` coalesces rapid toggles.
-        if let Some((msaa, smaa)) = pending_aa.take() {
+        if let Some(mode) = pending_aa.take() {
             reconfiguring.set(true);
             let cell = cell_loop.clone();
             let done = reconfiguring.clone();
@@ -521,45 +566,26 @@ async fn run(
                     done.set(false);
                     return;
                 };
-                // Tell main first — it raises the "compiling pipelines" modal
-                // for the whole recompile (the first switch in each direction
-                // really compiles; later ones hit the variant cache and the
-                // modal only flashes).
-                post_to_main(&RenderMsg::AaCompileStart { msaa, smaa });
-                if let Err(e) = renderer.set_anti_aliasing(aa_config((msaa, smaa))).await {
-                    tracing::error!("render thread: set_anti_aliasing failed: {e:?}");
-                    post_to_main(&RenderMsg::Error {
-                        message: format!("anti-aliasing change: {e:?}"),
-                    });
-                } else {
-                    // The actual pipeline compiles happen in commit_load —
-                    // stream its progress into the modal via the renderer's
-                    // shared phase label, deduped (the callback fires per
-                    // resolution).
-                    let mut last_line = String::new();
-                    let progress = |s: awsm_renderer::loading::LoadingStats| {
-                        let Some(line) = s.phase_label() else { return };
-                        if line != last_line {
-                            post_to_main(&RenderMsg::AaCompileProgress {
-                                message: line.clone(),
-                            });
-                            last_line = line;
-                        }
-                    };
-                    if let Err(e) = renderer.commit_load(progress).await {
-                        tracing::error!("render thread: commit_load after AA change failed: {e:?}");
-                        post_to_main(&RenderMsg::Error {
-                            message: format!("anti-aliasing pipelines: {e:?}"),
-                        });
-                    } else {
-                        tracing::info!(
-                            "render thread: anti-aliasing applied (msaa {msaa}, smaa {smaa})"
-                        );
+                // awsm-renderer-settings posts main the `aa-compile-*`
+                // messages that raise and lower the "compiling pipelines"
+                // overlay (the first switch in each direction really
+                // compiles; later ones hit the variant cache, and switching
+                // between TAA presets compiles nothing and shows no overlay).
+                // `aa-compile-done` is always posted, even on failure.
+                let applied = apply_anti_aliasing(&mut renderer, mode, |event| {
+                    post_to_page(&SettingsToPage::from(event));
+                })
+                .await;
+                match applied {
+                    Ok(()) => tracing::info!(
+                        "render thread: anti-aliasing applied: {}",
+                        AaMode::from_anti_aliasing(&renderer.anti_aliasing).label()
+                    ),
+                    Err(message) => {
+                        tracing::error!("render thread: {message}");
+                        post_to_main(&RenderMsg::Error { message });
                     }
                 }
-                // Always lower the modal — even on failure (the error line is
-                // already on its way to the status bar).
-                post_to_main(&RenderMsg::AaCompileDone);
                 *cell.borrow_mut() = Some(renderer);
                 done.set(false);
             });
@@ -581,169 +607,189 @@ async fn run(
             return;
         };
 
-        profile.begin_frame(r, motion.detail());
-        let mut lap_ms = work_t0;
-
-        // ── Frame start: publish this frame's time, waking physics ──────────
-        // The rAF argument is the frame's VSYNC-aligned time (see `RafCell`).
-        let frame_us = abs_time_us(time_origin, vsync_ms);
-        // What this frame shows: the world at the PREVIOUS frame's time minus
-        // one step — inside the pair of steps that frame's burst left (Fix
-        // Your Timestep's lerp by alpha), decided before the new burst starts.
-        let display_us = last_frame_us.map(|t| t.wrapping_sub(STEP_US));
-        // The camera main wrote at least half a frame ago: its previous
-        // frame's (see `CameraRing`).
-        let camera_cutoff_us =
-            last_frame_us.map(|t| t.wrapping_add((time_diff_us(frame_us, t).max(0) / 2) as u32));
-        last_frame_us = Some(frame_us);
-        // The span since the previous presented frame, for the missed-frame
-        // count — added before the tick, so a reader that sees this frame's
-        // tick also sees its span. The same span (ms) advances the clips and
-        // particles below; 0 on the first frame.
-        let frame_ms = match last_presented.replace(vsync_ms) {
-            Some(prev) => {
-                let span_ms = (vsync_ms - prev).max(0.0);
-                motion.add_frame_span_us((span_ms * 1000.0).round() as u64 as u32);
-                span_ms
-            }
-            None => 0.0,
-        };
-        // Physics now has the whole frame period to simulate up to
-        // `frame_us`; the next frame draws the result.
-        motion.begin_frame(frame_us);
-
-        if let Some(cutoff) = camera_cutoff_us {
-            if let Some((yaw, pitch, radius)) = camera_ring.read_at(cutoff) {
-                let mut cam = camera_loop.borrow_mut();
-                cam.yaw = yaw;
-                cam.pitch = pitch;
-                cam.radius = radius;
-            }
-        }
-        lap_ms = profile.lap(Phase::ReadApp, &perf, lap_ms);
-
-        // The scene's authored clips and texture UV flows, then its particles.
-        // Before the ball writes below, so physics has the last word on the
-        // slots it drives. (Don't animate a ball or its parents, though:
-        // `update_transforms` rewrites the slots of a subtree a clip moved,
-        // over the physics pose.)
-        let _ = r.update_animations(frame_ms);
-        particles.tick(r, (frame_ms / 1000.0) as f32);
-        lap_ms = profile.lap(Phase::Animate, &perf, lap_ms);
-
-        let (pos, rot, late) = sample_at(motion.ring(), display_us);
-        if late {
-            motion.note_app_late();
-        }
-        // Bake the ball mesh's authored scale in (the arena slot is the absolute
-        // world matrix). This thread is the sole writer of this slot.
-        let mat = Mat4::from_scale_rotation_translation(Vec3::splat(ball_visual_scale), rot, pos);
-        let cols = mat.to_cols_array();
-        // SAFETY: `binding` + `dirty_words_addr` address the ball's 64-byte arena
-        // slot in the shared `WebAssembly.Memory`, alive for the session; `cols`
-        // is exactly 16 f32 = 64 bytes.
-        let bytes = unsafe { std::slice::from_raw_parts(cols.as_ptr() as *const u8, 64) };
-        unsafe {
-            foreign_write(binding, dirty_words_addr, bytes);
-        }
-
-        // Dropped balls: physics bumps `count` after initializing each new
-        // slot, so mint the silver visual duplicate for any ball we haven't
-        // seen yet (transform + shared-arena binding), then interpolate every
-        // slot with the same alpha (all bodies advance in the same steps).
-        let ball_count = balls.count();
-        while ball_bindings.len() < ball_count {
-            let newest = balls.slot(ball_bindings.len()).read_latest();
-            let (cp, cq) = (newest.pos, newest.quat);
-            let tk = r.transforms.insert(
-                awsm_renderer::transforms::Transform {
-                    translation: Vec3::from_array(cp),
-                    rotation: Quat::from_array(cq),
-                    scale: Vec3::splat(ball_visual_scale),
-                },
-                None,
-            );
-            match r.duplicate_mesh_with_transform(ball_mesh, tk) {
-                Ok(dup) => {
-                    // The duplicate copies the source's CURRENT material —
-                    // which is the player's red tint. Silver it back.
-                    if let Err(err) = r.set_mesh_material(dup, ball_material) {
-                        tracing::warn!("dropped ball material reset failed: {err}");
-                    }
-                    match r.transforms.arena_slot_binding(tk) {
-                        Some(b) => ball_bindings.push(b),
-                        None => {
-                            tracing::error!("dropped ball has no arena slot");
-                            break;
-                        }
-                    }
+        STATS.with_borrow_mut(|stats| {
+            // Phase timing for the Stats panel, only while it shows the
+            // renderer's breakdown (awsm-renderer-stats).
+            stats.begin_renderer_frame(r, work_t0);
+            let timing = stats.renderer_detail();
+            let lap = |stats: &mut StatsCollector, phase: Phase| {
+                if timing {
+                    stats.lap(phase as usize, perf.now());
                 }
-                Err(err) => {
-                    tracing::error!("dropped ball duplicate failed: {err}");
-                    break;
+            };
+
+            // ── Frame start: publish this frame's time, waking physics ──────────
+            // The rAF argument is the frame's VSYNC-aligned time (see `RafCell`).
+            let frame_us = abs_time_us(time_origin, vsync_ms);
+            // What this frame shows: the world at the PREVIOUS frame's time minus
+            // one step — inside the pair of steps that frame's burst left (Fix
+            // Your Timestep's lerp by alpha), decided before the new burst starts.
+            let display_us = last_frame_us.map(|t| t.wrapping_sub(STEP_US));
+            // The camera main wrote at least half a frame ago: its previous
+            // frame's (see `CameraRing`).
+            let camera_cutoff_us = last_frame_us
+                .map(|t| t.wrapping_add((time_diff_us(frame_us, t).max(0) / 2) as u32));
+            last_frame_us = Some(frame_us);
+            // The span since the previous presented frame (ms) advances the
+            // clips and particles below; 0 on the first frame.
+            let frame_ms = last_presented
+                .replace(vsync_ms)
+                .map_or(0.0, |prev| (vsync_ms - prev).max(0.0));
+            // Physics now has the whole frame period to simulate up to
+            // `frame_us`; the next frame draws the result.
+            motion.begin_frame(frame_us);
+
+            if let Some(cutoff) = camera_cutoff_us {
+                if let Some((yaw, pitch, radius)) = camera_ring.read_at(cutoff) {
+                    let mut cam = camera_loop.borrow_mut();
+                    cam.yaw = yaw;
+                    cam.pitch = pitch;
+                    cam.radius = radius;
                 }
             }
-        }
-        for (slot_index, b) in ball_bindings.iter().enumerate() {
-            // Same display time as the player — every body advances in the
-            // same fixed steps.
-            let (pos, rot, _) = sample_at(balls.slot(slot_index), display_us);
+            lap(stats, Phase::ReadApp);
+
+            // The scene's authored clips and texture UV flows, then its particles.
+            // Before the ball writes below, so physics has the last word on the
+            // slots it drives. (Don't animate a ball or its parents, though:
+            // `update_transforms` rewrites the slots of a subtree a clip moved,
+            // over the physics pose.)
+            let _ = r.update_animations(frame_ms);
+            particles.tick(r, (frame_ms / 1000.0) as f32);
+            lap(stats, Phase::Animate);
+
+            let (pos, rot, late) = sample_at(motion.ring(), display_us);
+            // A teleport (see `TELEPORT_JUMP_M`): under TAA the ball's motion
+            // history goes, in the frame the jump is drawn.
+            let teleported = |drawn_at: &mut Vec<Vec3>, index: usize, pos: Vec3| {
+                if drawn_at.len() <= index {
+                    drawn_at.push(pos);
+                    return false;
+                }
+                let jumped = drawn_at[index].distance(pos) > TELEPORT_JUMP_M;
+                drawn_at[index] = pos;
+                jumped
+            };
+            if teleported(&mut drawn_at, 0, pos) {
+                r.reset_motion_history(ball_tk);
+            }
+            // Bake the ball mesh's authored scale in (the arena slot is the absolute
+            // world matrix). This thread is the sole writer of this slot.
             let mat =
                 Mat4::from_scale_rotation_translation(Vec3::splat(ball_visual_scale), rot, pos);
             let cols = mat.to_cols_array();
-            // SAFETY: same contract as the player-ball write above — each
-            // binding addresses that duplicate's 64-byte arena slot.
+            // SAFETY: `binding` + `dirty_words_addr` address the ball's 64-byte arena
+            // slot in the shared `WebAssembly.Memory`, alive for the session; `cols`
+            // is exactly 16 f32 = 64 bytes.
             let bytes = unsafe { std::slice::from_raw_parts(cols.as_ptr() as *const u8, 64) };
             unsafe {
-                foreign_write(*b, dirty_words_addr, bytes);
+                foreign_write(binding, dirty_words_addr, bytes);
             }
-        }
-        lap_ms = profile.lap(Phase::ReadApp, &perf, lap_ms);
 
-        let cam = camera_loop.borrow();
-        // ONE camera API: a view matrix plus projection params. The renderer
-        // supplies the depth convention (reverse-Z by default) and the live
-        // surface aspect itself, so neither can drift from what it actually
-        // renders with — hand-rolling a projection here would invert every
-        // depth test. Focus on the orbit pivot so DoF tracks the dolly;
-        // aperture stays at the f/5.6 default.
-        let view = Mat4::look_at_rh(cam.eye(), cam.look_at, Vec3::Y);
-        let mut params =
-            CameraParams::perspective(CAMERA_FOV_Y_DEG.to_radians(), CAMERA_NEAR, CAMERA_FAR);
-        params.focus_distance = cam.radius;
-        let _ = r.set_camera(view, params);
-        drop(cam);
-        lap_ms = profile.lap(Phase::SetCamera, &perf, lap_ms);
-        // Folds the ball slot we just wrote (plus any other dirty slots) into
-        // world matrices for this frame.
-        r.update_transforms();
-        lap_ms = profile.lap(Phase::UpdateTransforms, &perf, lap_ms);
-        if let Err(err) = r.render(None) {
-            tracing::warn!("render thread: render error: {err}");
-        }
-        profile.lap(Phase::Render, &perf, lap_ms);
-
-        // Publish the renderer's GPU frame-time totals for the stats panel
-        // (timestamp-query readbacks land a few frames late; only push when a
-        // new sample arrived).
-        if let Some(gpu) = awsm_renderer::profiling::gpu_frame_timing() {
-            if gpu.count != gpu_samples_seen {
-                gpu_samples_seen = gpu.count;
-                motion.set_gpu_totals((gpu.total_ms * 1000.0) as u64 as u32, gpu.count as u32);
+            // Dropped balls: physics bumps `count` after initializing each new
+            // slot, so mint the silver visual duplicate for any ball we haven't
+            // seen yet (transform + shared-arena binding), then interpolate every
+            // slot with the same alpha (all bodies advance in the same steps).
+            let ball_count = balls.count();
+            while ball_bindings.len() < ball_count {
+                let newest = balls.slot(ball_bindings.len()).read_latest();
+                let (cp, cq) = (newest.pos, newest.quat);
+                let tk = r.transforms.insert(
+                    awsm_renderer::transforms::Transform {
+                        translation: Vec3::from_array(cp),
+                        rotation: Quat::from_array(cq),
+                        scale: Vec3::splat(ball_visual_scale),
+                    },
+                    None,
+                );
+                match r.duplicate_mesh_with_transform(ball_mesh, tk) {
+                    Ok(dup) => {
+                        // The duplicate copies the source's CURRENT material —
+                        // which is the player's red tint. Silver it back.
+                        if let Err(err) = r.set_mesh_material(dup, ball_material) {
+                            tracing::warn!("dropped ball material reset failed: {err}");
+                        }
+                        match r.transforms.arena_slot_binding(tk) {
+                            Some(b) => ball_bindings.push((b, tk)),
+                            None => {
+                                tracing::error!("dropped ball has no arena slot");
+                                break;
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!("dropped ball duplicate failed: {err}");
+                        break;
+                    }
+                }
             }
-        }
+            for (slot_index, (b, tk)) in ball_bindings.iter().enumerate() {
+                // Same display time as the player — every body advances in the
+                // same fixed steps.
+                let (pos, rot, _) = sample_at(balls.slot(slot_index), display_us);
+                if teleported(&mut drawn_at, slot_index + 1, pos) {
+                    r.reset_motion_history(*tk);
+                }
+                let mat =
+                    Mat4::from_scale_rotation_translation(Vec3::splat(ball_visual_scale), rot, pos);
+                let cols = mat.to_cols_array();
+                // SAFETY: same contract as the player-ball write above — each
+                // binding addresses that duplicate's 64-byte arena slot.
+                let bytes = unsafe { std::slice::from_raw_parts(cols.as_ptr() as *const u8, 64) };
+                unsafe {
+                    foreign_write(*b, dirty_words_addr, bytes);
+                }
+            }
+            lap(stats, Phase::ReadApp);
 
-        if let Some(entries) = profile.end_frame(vsync_ms) {
-            post_to_main(&RenderMsg::Timings { entries });
-        }
+            let cam = camera_loop.borrow();
+            // ONE camera API: a view matrix plus projection params. The renderer
+            // supplies the depth convention (reverse-Z by default) and the live
+            // surface aspect itself, so neither can drift from what it actually
+            // renders with — hand-rolling a projection here would invert every
+            // depth test. Focus on the orbit pivot so DoF tracks the dolly;
+            // aperture stays at the f/5.6 default.
+            let view = Mat4::look_at_rh(cam.eye(), cam.look_at, Vec3::Y);
+            let mut params =
+                CameraParams::perspective(CAMERA_FOV_Y_DEG.to_radians(), CAMERA_NEAR, CAMERA_FAR);
+            params.focus_distance = cam.radius;
+            let _ = r.set_camera(view, params);
+            drop(cam);
+            lap(stats, Phase::SetCamera);
+            // Folds the ball slot we just wrote (plus any other dirty slots) into
+            // world matrices for this frame.
+            r.update_transforms();
+            lap(stats, Phase::UpdateTransforms);
+            if let Err(err) = r.render(None) {
+                tracing::warn!("render thread: render error: {err}");
+            }
+            lap(stats, Phase::Render);
 
-        // Publish this frame's CPU cost (µs) for the Stats panel's renderer group.
-        motion.add_frame_work_us(((perf.now() - work_t0) * 1000.0).max(0.0) as u32);
+            // The frame's stats: about once a second the collector closes a
+            // window, the physics group is built from the shared counters, and
+            // the report goes to main's Stats panel.
+            let input = FrameInput {
+                late,
+                ..FrameInput::new(vsync_ms, perf.now() - work_t0)
+            };
+            if let Some(window) = stats.end_frame(input, &RendererTimings) {
+                let section = physics_stats.section(stats, &window, motion, balls.count());
+                post_report(stats.report(&window, vec![section]));
+            }
+            // Physics times its step phases only while its group is open.
+            motion.set_detail(if stats.is_open(crate::stats::PHYSICS) {
+                DETAIL_PHYSICS
+            } else {
+                0
+            });
 
-        frame_count = frame_count.wrapping_add(1);
-        if frame_count == 3 {
-            post_to_main(&RenderMsg::Ready);
-        }
+            frame_count = frame_count.wrapping_add(1);
+            if frame_count == 3 {
+                post_to_main(&RenderMsg::Ready);
+                // The scene is on screen: the stats warm up from here.
+                post_report(stats.mark_ready());
+            }
+        });
         if let Some(cb) = raf_run.borrow().as_ref() {
             let _ = awsm_renderer::web_global::request_animation_frame(cb.as_ref().unchecked_ref());
         }
@@ -952,52 +998,80 @@ fn aspect(canvas: &web_sys::OffscreenCanvas) -> f32 {
     (canvas.width().max(1) as f32) / (canvas.height().max(1) as f32)
 }
 
-/// Install this worker's `onmessage`: [`DropMsg`] clicks, canvas resizes and
-/// anti-aliasing changes. Overrides the bootstrap's init handler, which has
-/// already done its job by now. (The camera does not come through here: see
-/// [`CameraRing`].)
+/// Install this worker's `onmessage`, for the rest of its life (it replaces
+/// the bootstrap's init handler, which has done its job): the kit's messages
+/// — Settings' `anti-alias` and `resize`, the stats panel's `stats-view` and
+/// `stats-page` — and [`DropMsg`] clicks. (The camera does not come through
+/// here: see [`CameraRing`].)
 ///
-/// A click becomes a ball: unproject the NDC point through the current camera
-/// onto the tabletop plane, clamp it to the table interior (inside the rails),
-/// and file a drop request in the shared [`BallMotions`] block for physics to
-/// pick up on its next step.
+/// A click becomes a ball once the scene is loaded (`drop_target`): unproject
+/// the NDC point through the current camera onto the tabletop plane, clamp
+/// it to the table interior (inside the rails), and file a drop request in
+/// the shared [`BallMotions`] block for physics to pick up on its next step.
 fn install_render_input(
     camera: Rc<RefCell<OrbitCamera>>,
     canvas: web_sys::OffscreenCanvas,
-    balls: &'static BallMotions,
-    floor: Option<([f32; 3], [f32; 3])>,
-    ball_radius: f32,
-    pending_aa: Rc<Cell<Option<(bool, bool)>>>,
+    drop_target: Rc<RefCell<Option<DropTarget>>>,
+    pending_aa: Rc<Cell<Option<AaMode>>>,
 ) -> Result<(), JsValue> {
     let scope = js_sys::global().unchecked_into::<web_sys::DedicatedWorkerGlobalScope>();
     let cb = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |e: web_sys::MessageEvent| {
-        // A Settings anti-aliasing toggle — stash it for the render loop to
-        // apply (it owns the renderer; we can't touch it from here).
-        if let Ok(QualityMsg::AntiAlias { msaa, smaa }) =
-            serde_wasm_bindgen::from_value::<QualityMsg>(e.data())
-        {
-            pending_aa.set(Some((msaa, smaa)));
-            return;
-        }
-        // Canvas resize (main's ResizeObserver): apply the new device-pixel
-        // backing size to the transferred OffscreenCanvas. The render loop
-        // recomputes the camera aspect from the canvas every frame, and the
-        // surface reconfigures to the new size on the next present.
-        if let Ok(ResizeMsg::Canvas { width, height }) =
-            serde_wasm_bindgen::from_value::<ResizeMsg>(e.data())
-        {
-            if width > 0 && height > 0 {
-                canvas.set_width(width);
-                canvas.set_height(height);
+        let data = e.data();
+        match SettingsToWorker::from_js(&data) {
+            // A Settings anti-aliasing change — stash it for the render loop
+            // to apply (it owns the renderer; we can't touch it from here).
+            // A newer change replaces one not applied yet.
+            Some(Ok(SettingsToWorker::AntiAlias { mode })) => {
+                pending_aa.set(Some(mode));
+                return;
             }
-            return;
+            // Canvas resize (the Settings panel follows the canvas's layout
+            // size and the resolution slider): apply the new device-pixel
+            // backing size to the transferred OffscreenCanvas. The render
+            // loop recomputes the camera aspect from the canvas every frame,
+            // and the surface reconfigures to the new size on the next
+            // present.
+            Some(Ok(SettingsToWorker::Resize { width, height })) => {
+                if width > 0 && height > 0 {
+                    canvas.set_width(width);
+                    canvas.set_height(height);
+                }
+                return;
+            }
+            Some(Err(err)) => {
+                post_to_main(&RenderMsg::Error {
+                    message: format!("a settings message did not parse: {err}"),
+                });
+                return;
+            }
+            None => {}
         }
-        if let Ok(DropMsg::Ball { ndc_x, ndc_y }) =
-            serde_wasm_bindgen::from_value::<DropMsg>(e.data())
+        match StatsToWorker::from_js(&data) {
+            Some(Ok(message)) => {
+                STATS.with_borrow_mut(|stats| stats.handle(message));
+                return;
+            }
+            Some(Err(err)) => {
+                post_to_main(&RenderMsg::Error {
+                    message: format!("a stats message did not parse: {err}"),
+                });
+                return;
+            }
+            None => {}
+        }
+        if let Ok(DropMsg::Ball { ndc_x, ndc_y }) = serde_wasm_bindgen::from_value::<DropMsg>(data)
         {
-            let Some((floor_he, floor_tr)) = floor else {
+            let target = drop_target.borrow();
+            let Some(DropTarget {
+                balls,
+                floor: Some((floor_he, floor_tr)),
+                ball_radius,
+            }) = target.as_ref()
+            else {
                 return;
             };
+            let (balls, floor_he, floor_tr, ball_radius) =
+                (*balls, *floor_he, *floor_tr, *ball_radius);
             let cam = camera.borrow();
             let view = Mat4::look_at_rh(cam.eye(), cam.look_at, Vec3::Y);
             let projection = Mat4::perspective_rh(
@@ -1036,47 +1110,6 @@ fn install_render_input(
     scope.set_onmessage(Some(cb.as_ref().unchecked_ref()));
     cb.forget();
     Ok(())
-}
-
-/// Map the Settings `(msaa, smaa)` toggle pair onto the renderer's config:
-/// MSAA is 4× or off (the only counts it supports), mipmapping always on.
-/// Used both at BUILD time (the startup prefs, so boot compiles exactly the
-/// variants this session needs — no post-`Ready` reconcile recompile) and for
-/// runtime Settings changes.
-fn aa_config((msaa, smaa): (bool, bool)) -> awsm_renderer::anti_alias::AntiAliasing {
-    awsm_renderer::anti_alias::AntiAliasing {
-        msaa_sample_count: if msaa { Some(4) } else { None },
-        smaa,
-        mipmap: true,
-    }
-}
-
-/// Probe the WebGPU adapter for the two facts main needs to size the canvas —
-/// whether it's a software fallback (start resolution low) and its max 2D
-/// texture dimension (the backing-store cap) — and post them to main. Failures
-/// degrade to safe defaults (not fallback, the WebGPU-guaranteed 8192 minimum).
-async fn report_gpu_info() {
-    use wasm_bindgen_futures::JsFuture;
-    let (is_fallback, max_texture_dim) = match awsm_renderer::web_global::navigator_gpu() {
-        Some(gpu) => match JsFuture::from(gpu.request_adapter()).await {
-            Ok(v) if !v.is_null() && !v.is_undefined() => {
-                let adapter: web_sys::GpuAdapter = v.unchecked_into();
-                (
-                    adapter.info().is_fallback_adapter(),
-                    adapter.limits().max_texture_dimension_2d(),
-                )
-            }
-            _ => (false, 8192),
-        },
-        None => (false, 8192),
-    };
-    tracing::info!(
-        "render thread: gpu info — fallback {is_fallback}, max_texture_2d {max_texture_dim}"
-    );
-    post_to_main(&RenderMsg::GpuInfo {
-        is_fallback,
-        max_texture_dim,
-    });
 }
 
 /// Post a human-readable load-progress line to main (the loading screen).

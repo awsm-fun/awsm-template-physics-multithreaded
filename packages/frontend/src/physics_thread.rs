@@ -213,6 +213,9 @@ pub fn start(payload: JsValue) -> Result<(), JsValue> {
             pool: pool.addr() as f64,
             count: pool_workers,
         });
+        // The render worker's stats read the pool's per-executor task time
+        // (the solver's work split) from here.
+        motion.set_pool(pool.addr(), pool_workers);
         tracing::info!(
             "physics thread: task pool requested — {pool_workers} workers \
              (hardware_concurrency {hardware}), Box3D workerCount {}",
@@ -350,7 +353,7 @@ pub fn start(payload: JsValue) -> Result<(), JsValue> {
     let mut step_ms_acc: f64 = 0.0;
     let mut step_ms_count: u32 = 0;
     // The Stats panel's step phases (`STEP_PHASES`): running totals (ms) and
-    // the steps they cover, timed only while main sets `DETAIL_PHYSICS`.
+    // the steps they cover, timed only while render sets `DETAIL_PHYSICS`.
     let mut phase_ms = [0.0_f64; STEP_PHASES.len()];
     let mut phase_steps: u64 = 0;
     let mut phases_published_us: u32 = 0;
